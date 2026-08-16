@@ -7,12 +7,26 @@
 ; (%APPDATA%\obs-studio\plugins\<plugin>) which OBS 28 and newer scan on startup.
 ; That location needs no administrator rights and no OBS install-path detection,
 ; and it matches the directory layout CMake already stages into release/<config>.
+;
+; UPGRADE FROM 1.2.0 (the "castpilot" module name). OBS loads EVERY module folder it
+; finds, so a leftover plugins\castpilot next to plugins\castbeacon means two modules,
+; two shadow outputs and one relay path — they evict each other every couple of seconds.
+; This installer therefore deletes the whole legacy folder before it copies anything,
+; and warns about copies it cannot reach (see [Code]).
+;
+; What is deliberately NOT touched: plugin_config\castpilot\settings.json. That is the
+; app's settings file, and the renamed plugin still reads it as a fallback for app
+; versions that only know the old path. Deleting it would silently reset the operator's
+; overflow encode settings.
 
 #define PluginName        "@PLUGIN_NAME@"
 #define PluginDisplayName "@PLUGIN_DISPLAY_NAME@"
 #define PluginVersion     "@PLUGIN_VERSION@"
 #define PluginAuthor      "@PLUGIN_AUTHOR@"
 #define PayloadDir        "@PAYLOAD_DIR@"
+
+; The module name this plugin shipped under before 1.3.0.
+#define LegacyPluginName  "castpilot"
 
 [Setup]
 ; Keep this GUID stable across releases so upgrades replace rather than stack.
@@ -29,6 +43,11 @@ UninstallDisplayName={#PluginDisplayName} {#PluginVersion}
 ; The install location is fixed by OBS convention - letting the user move it
 ; would simply produce a plugin OBS never loads.
 DisableDirPage=yes
+; The AppId is stable, so a 1.2.0 install has recorded plugins\castpilot as its
+; directory. Without this the rename would install castbeacon.dll straight back
+; into the old folder, and the whole point of the rename (a castbeacon module
+; config dir) would be lost.
+UsePreviousAppDir=no
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=@OUTPUT_DIR@
@@ -40,10 +59,138 @@ WizardStyle=modern
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[InstallDelete]
+; Remove the pre-1.3.0 module entirely - DLL, data, its own uninstaller, and anything
+; else left in the tree. Runs before any file is copied.
+Type: filesandordirs; Name: "{userappdata}\obs-studio\plugins\{#LegacyPluginName}"
+
 [Files]
 Source: "{#PayloadDir}\bin\64bit\{#PluginName}.dll"; DestDir: "{app}\bin\64bit"; Flags: ignoreversion
 Source: "{#PayloadDir}\data\*"; DestDir: "{app}\data"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [UninstallDelete]
+; Parity with [Files]: everything this installer created, and nothing else. The
+; operator's plugin_config settings survive an uninstall on purpose.
 Type: filesandordirs; Name: "{app}\bin"
 Type: filesandordirs; Name: "{app}\data"
+Type: dirifempty; Name: "{app}"
+
+[Code]
+{ ---------------------------------------------------------------------------
+  Pre-install checks. Two ways an upgrade can leave OBS loading two modules:
+
+  1. OBS is open, so the old DLL is locked and the cleanup half-fails.
+  2. Someone hand-copied the plugin into OBS's program-wide plugin folder. A
+     per-user installer cannot delete that (it needs administrator rights), so
+     the honest move is to name the exact paths and let the operator decide.
+  --------------------------------------------------------------------------- }
+
+function IsObsRunning(): Boolean;
+var
+  Locator, Service, Items: Variant;
+begin
+  Result := False;
+  try
+    Locator := CreateOleObject('WbemScripting.SWbemLocator');
+    Service := Locator.ConnectServer('.', 'root\CIMV2');
+    Items := Service.ExecQuery('SELECT ProcessId FROM Win32_Process WHERE Name = "obs64.exe"');
+    Result := Items.Count > 0;
+  except
+    { WMI unavailable (locked down box). Don't invent a state - fall through and let
+      Inno's own in-use file detection handle whatever it can. }
+    Result := False;
+  end;
+end;
+
+{ Where OBS itself is installed, so the system-wide plugin folder can be checked.
+  OBS's installer records its directory in HKLM\SOFTWARE\OBS Studio; the default
+  locations are the fallback. Empty string = OBS not found, nothing to check. }
+function ObsProgramDir(): String;
+var
+  Root: Integer;
+  Dir: String;
+begin
+  Result := '';
+
+  if IsWin64 then
+    Root := HKLM64
+  else
+    Root := HKEY_LOCAL_MACHINE;
+
+  if RegQueryStringValue(Root, 'SOFTWARE\OBS Studio', '', Dir) and (Dir <> '') then
+  begin
+    Result := RemoveBackslashUnlessRoot(Dir);
+    Exit;
+  end;
+
+  if DirExists(ExpandConstant('{commonpf64}\obs-studio')) then
+    Result := ExpandConstant('{commonpf64}\obs-studio')
+  else if DirExists(ExpandConstant('{commonpf32}\obs-studio')) then
+    Result := ExpandConstant('{commonpf32}\obs-studio');
+end;
+
+{ A newline-separated list of system-wide copies of this plugin (either module name),
+  or '' when there are none. }
+function SystemWideCopies(): String;
+var
+  ObsDir, List: String;
+begin
+  List := '';
+  ObsDir := ObsProgramDir();
+
+  if ObsDir <> '' then
+  begin
+    if FileExists(ObsDir + '\obs-plugins\64bit\{#LegacyPluginName}.dll') then
+      List := List + '    ' + ObsDir + '\obs-plugins\64bit\{#LegacyPluginName}.dll' + #13#10;
+    if FileExists(ObsDir + '\obs-plugins\64bit\{#PluginName}.dll') then
+      List := List + '    ' + ObsDir + '\obs-plugins\64bit\{#PluginName}.dll' + #13#10;
+    if DirExists(ObsDir + '\data\obs-plugins\{#LegacyPluginName}') then
+      List := List + '    ' + ObsDir + '\data\obs-plugins\{#LegacyPluginName}\' + #13#10;
+    if DirExists(ObsDir + '\data\obs-plugins\{#PluginName}') then
+      List := List + '    ' + ObsDir + '\data\obs-plugins\{#PluginName}\' + #13#10;
+  end;
+
+  Result := List;
+end;
+
+function InitializeSetup(): Boolean;
+var
+  Copies: String;
+begin
+  Result := True;
+
+  while IsObsRunning() do
+  begin
+    if MsgBox('OBS Studio is running.' + #13#10#13#10 +
+              'Close OBS completely, then click Retry.' + #13#10#13#10 +
+              'Installing while OBS is open leaves the previous plugin file locked, so the ' +
+              'upgrade only half-applies - and OBS can end up loading two copies of the plugin, ' +
+              'which fight over the relay connection.',
+              mbError, MB_RETRYCANCEL) = IDCANCEL then
+    begin
+      Result := False;
+      Exit;
+    end;
+  end;
+
+  Copies := SystemWideCopies();
+  if Copies <> '' then
+  begin
+    if MsgBox('A copy of this plugin is already installed system-wide, inside OBS''s own ' +
+              'program folder:' + #13#10#13#10 +
+              Copies + #13#10 +
+              'This installer only writes to your personal OBS plugins folder, and it cannot ' +
+              'delete those files - they are in a protected location that needs administrator ' +
+              'rights.' + #13#10#13#10 +
+              'If both copies remain, OBS loads the plugin twice. The two feeds publish to the ' +
+              'same relay path and knock each other offline every few seconds.' + #13#10#13#10 +
+              'Recommended: cancel, delete the files listed above as an administrator, then run ' +
+              'this installer again.' + #13#10#13#10 +
+              'Install anyway?',
+              mbError, MB_YESNO) = IDNO then
+    begin
+      Result := False;
+      Exit;
+    end;
+  end;
+end;
