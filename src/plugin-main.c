@@ -124,8 +124,7 @@ static bool url_is_local_ingest(const char *url)
 	if ((port && *port ? atoi(port) : SHADOW_PORT) != SHADOW_PORT)
 		return false;
 
-	return astrcmpi(host, "127.0.0.1") == 0 || astrcmpi(host, "localhost") == 0 ||
-	       astrcmpi(host, "::1") == 0;
+	return astrcmpi(host, "127.0.0.1") == 0 || astrcmpi(host, "localhost") == 0 || astrcmpi(host, "::1") == 0;
 }
 
 /* True when OBS's own stream output already publishes to our relay, i.e. the app is downstream of
@@ -220,8 +219,7 @@ static void start_shadow(void)
 			obs_data_set_int(settings, "bitrate", bitrate);
 			obs_data_set_int(settings, "max_bitrate", bitrate);
 		}
-		local_venc = obs_video_encoder_create(
-			enc_id ? enc_id : "obs_x264", "castpilot_venc", settings, NULL);
+		local_venc = obs_video_encoder_create(enc_id ? enc_id : "obs_x264", "castpilot_venc", settings, NULL);
 		obs_data_release(settings);
 	}
 
@@ -268,13 +266,11 @@ static void start_shadow(void)
 
 	if (obs_output_start(shadow_output)) {
 		if (applied_fps > 0)
-			obs_log(LOG_INFO, "overflow feed -> %s/%s (%s, keyint %ds%s, %dfps)",
-				SHADOW_SERVER, SHADOW_KEY,
+			obs_log(LOG_INFO, "overflow feed -> %s/%s (%s, keyint %ds%s, %dfps)", SHADOW_SERVER, SHADOW_KEY,
 				local_venc ? "dedicated encoder" : "shared encoder", keyint,
 				(local_venc && bitrate > 0) ? ", custom bitrate" : "", applied_fps);
 		else
-			obs_log(LOG_INFO, "overflow feed -> %s/%s (%s, keyint %ds%s)",
-				SHADOW_SERVER, SHADOW_KEY,
+			obs_log(LOG_INFO, "overflow feed -> %s/%s (%s, keyint %ds%s)", SHADOW_SERVER, SHADOW_KEY,
 				local_venc ? "dedicated encoder" : "shared encoder", keyint,
 				(local_venc && bitrate > 0) ? ", custom bitrate" : "");
 	} else {
