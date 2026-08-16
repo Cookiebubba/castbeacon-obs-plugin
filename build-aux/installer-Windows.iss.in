@@ -3,21 +3,33 @@
 ; This is a template: .github/scripts/Package-Windows.ps1 substitutes the @TOKEN@
 ; placeholders and compiles the result with ISCC. Do not run ISCC on this file directly.
 ;
-; The plugin is installed into the per-user OBS plugin directory
-; (%APPDATA%\obs-studio\plugins\<plugin>) which OBS 28 and newer scan on startup.
-; That location needs no administrator rights and no OBS install-path detection,
-; and it matches the directory layout CMake already stages into release/<config>.
+; WHERE OBS ACTUALLY LOOKS ON WINDOWS. Not %APPDATA%. OBS builds its one external
+; plugin search path in AddExtraModulePaths() (frontend/widgets/OBSBasic.cpp):
+;
+;     #if defined(_WIN32)
+;         GetProgramDataPath(base_module_dir, ..., "obs-studio/plugins/%module%");
+;     #elif defined(__APPLE__) / #else
+;         GetAppConfigPath(base_module_dir, ..., "obs-studio/plugins/%module%");
+;
+; then adds "<that>/bin/64bit" and "<that>/data". So the per-user config directory is
+; a mac/Linux convention; on Windows the root is %ProgramData%. 1.3.0 installed to
+; %APPDATA%\obs-studio\plugins\castbeacon, which OBS never scans - it produced no log
+; line at all, not even a "skipping module". 1.3.1 installs to ProgramData.
 ;
 ; UPGRADE FROM 1.2.0 (the "castpilot" module name). OBS loads EVERY module folder it
-; finds, so a leftover plugins\castpilot next to plugins\castbeacon means two modules,
-; two shadow outputs and one relay path — they evict each other every couple of seconds.
-; This installer therefore deletes the whole legacy folder before it copies anything,
-; and warns about copies it cannot reach (see [Code]).
+; finds, so a leftover castpilot folder next to castbeacon means two modules, two
+; shadow outputs and one relay path - they evict each other every couple of seconds.
+; This installer deletes the obsolete folders before it copies anything, in BOTH roots
+; (a hand-made ProgramData install is exactly what resurrected the old plugin on the
+; dev box), and offers to remove copies inside OBS's own program folder.
 ;
 ; What is deliberately NOT touched: plugin_config\castpilot\settings.json. That is the
 ; app's settings file, and the renamed plugin still reads it as a fallback for app
 ; versions that only know the old path. Deleting it would silently reset the operator's
-; overflow encode settings.
+; overflow encode settings. Note that plugin_config genuinely does live under %APPDATA%
+; - OBS derives it from the module's FILE NAME and its own config root, not from where
+; the DLL sits (obs_module_get_config_path, libobs/obs-module.c), so moving the install
+; to ProgramData does not move the settings.
 
 #define PluginName        "@PLUGIN_NAME@"
 #define PluginDisplayName "@PLUGIN_DISPLAY_NAME@"
@@ -28,9 +40,13 @@
 ; The module name this plugin shipped under before 1.3.0.
 #define LegacyPluginName  "castpilot"
 
+; Kept without braces so it can be spelled both as an Inno constant-escaped AppId and
+; as a registry key name below, from one definition.
+#define AppGuidBare       "113E453B-E0EA-45A3-AABD-BF093378B668"
+
 [Setup]
 ; Keep this GUID stable across releases so upgrades replace rather than stack.
-AppId={{113E453B-E0EA-45A3-AABD-BF093378B668}
+AppId={{{#AppGuidBare}}
 AppName={#PluginDisplayName}
 AppVersion={#PluginVersion}
 AppVerName={#PluginDisplayName} {#PluginVersion}
@@ -38,18 +54,23 @@ AppPublisher={#PluginAuthor}
 VersionInfoVersion={#PluginVersion}
 VersionInfoCompany={#PluginAuthor}
 VersionInfoDescription={#PluginDisplayName} installer
-DefaultDirName={userappdata}\obs-studio\plugins\{#PluginName}
+DefaultDirName={commonappdata}\obs-studio\plugins\{#PluginName}
 UninstallDisplayName={#PluginDisplayName} {#PluginVersion}
 ; The install location is fixed by OBS convention - letting the user move it
 ; would simply produce a plugin OBS never loads.
 DisableDirPage=yes
-; The AppId is stable, so a 1.2.0 install has recorded plugins\castpilot as its
-; directory. Without this the rename would install castbeacon.dll straight back
-; into the old folder, and the whole point of the rename (a castbeacon module
-; config dir) would be lost.
+; The AppId is stable, so an earlier install has recorded its own directory - and for
+; 1.3.0 that directory is the wrong one. Without this, Setup would reinstall straight
+; back into %APPDATA% and the fix would do nothing. It also covers the dev box's
+; hand-moved copy, which has no recorded directory at all.
 UsePreviousAppDir=no
 DisableProgramGroupPage=yes
-PrivilegesRequired=lowest
+; ProgramData is a machine-wide location. Its default ACL lets a standard user CREATE
+; files, but not overwrite or delete files another account created - which is exactly
+; what an upgrade has to do. Rather than install fine today and fail on the next
+; upgrade (or on any machine where OBS was set up by a different account), require
+; elevation up front and say so in the release notes.
+PrivilegesRequired=admin
 OutputDir=@OUTPUT_DIR@
 OutputBaseFilename=@OUTPUT_BASENAME@
 Compression=lzma2
@@ -60,9 +81,29 @@ WizardStyle=modern
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [InstallDelete]
-; Remove the pre-1.3.0 module entirely - DLL, data, its own uninstaller, and anything
-; else left in the tree. Runs before any file is copied.
+; Obsolete module folders, in both roots. All of these run before any file is copied.
+;
+; ProgramData\castpilot is the one that actually matters: OBS scans it, so a hand-made
+; dev install there keeps the pre-rename module alive alongside this one.
+Type: filesandordirs; Name: "{commonappdata}\obs-studio\plugins\{#LegacyPluginName}"
+; The %APPDATA% pair is inert on Windows (OBS never looks there) but confusing, and
+; 1.3.0's installer left a castbeacon folder there on every machine that ran it.
+; Best-effort: if Setup was elevated with a different account, {userappdata} is that
+; account's - a miss here costs nothing because nothing loads from it.
 Type: filesandordirs; Name: "{userappdata}\obs-studio\plugins\{#LegacyPluginName}"
+Type: filesandordirs; Name: "{userappdata}\obs-studio\plugins\{#PluginName}"
+; Overwrite a hand-placed copy cleanly rather than merging into it. unins*.* covers a
+; stray uninstaller that came along with a folder someone moved here by hand; Setup
+; writes its own afterwards.
+Type: filesandordirs; Name: "{app}\bin"
+Type: filesandordirs; Name: "{app}\data"
+Type: files; Name: "{app}\unins*.*"
+
+[Registry]
+; 1.3.0 installed per-user, so its Add/Remove entry lives in HKCU and an elevated
+; (HKLM) install will not replace it - it would dangle, pointing at the folder deleted
+; above. Same AppId, so this one key covers both 1.2.0 and 1.3.0.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{{{#AppGuidBare}}_is1"; ValueType: none; Flags: deletekey
 
 [Files]
 Source: "{#PayloadDir}\bin\64bit\{#PluginName}.dll"; DestDir: "{app}\bin\64bit"; Flags: ignoreversion
@@ -80,9 +121,10 @@ Type: dirifempty; Name: "{app}"
   Pre-install checks. Two ways an upgrade can leave OBS loading two modules:
 
   1. OBS is open, so the old DLL is locked and the cleanup half-fails.
-  2. Someone hand-copied the plugin into OBS's program-wide plugin folder. A
-     per-user installer cannot delete that (it needs administrator rights), so
-     the honest move is to name the exact paths and let the operator decide.
+  2. Someone hand-copied the plugin into OBS's own program folder. [InstallDelete]
+     covers the two plugin roots OBS scans; it cannot cover an in-tree copy, because
+     that path is not knowable at compile time. So find it, name it, and - now that
+     Setup runs elevated - offer to remove it instead of only complaining.
   --------------------------------------------------------------------------- }
 
 function IsObsRunning(): Boolean;
@@ -102,9 +144,9 @@ begin
   end;
 end;
 
-{ Where OBS itself is installed, so the system-wide plugin folder can be checked.
-  OBS's installer records its directory in HKLM\SOFTWARE\OBS Studio; the default
-  locations are the fallback. Empty string = OBS not found, nothing to check. }
+{ Where OBS itself is installed, so its in-tree plugin folder can be checked. OBS's
+  installer records its directory in HKLM\SOFTWARE\OBS Studio; the default locations
+  are the fallback. Empty string = OBS not found, nothing to check. }
 function ObsProgramDir(): String;
 var
   Root: Integer;
@@ -129,33 +171,80 @@ begin
     Result := ExpandConstant('{commonpf32}\obs-studio');
 end;
 
-{ A newline-separated list of system-wide copies of this plugin (either module name),
-  or '' when there are none. }
-function SystemWideCopies(): String;
+{ Copies of either module name sitting inside OBS's own program folder. Count is
+  returned; Paths is filled with one path per line for display. }
+function InTreeCopies(var Paths: String): Integer;
 var
-  ObsDir, List: String;
+  ObsDir: String;
+  Candidates: array[0..3] of String;
+  IsDir: array[0..3] of Boolean;
+  I, Found: Integer;
 begin
-  List := '';
-  ObsDir := ObsProgramDir();
+  Paths := '';
+  Found := 0;
 
-  if ObsDir <> '' then
+  ObsDir := ObsProgramDir();
+  if ObsDir = '' then
   begin
-    if FileExists(ObsDir + '\obs-plugins\64bit\{#LegacyPluginName}.dll') then
-      List := List + '    ' + ObsDir + '\obs-plugins\64bit\{#LegacyPluginName}.dll' + #13#10;
-    if FileExists(ObsDir + '\obs-plugins\64bit\{#PluginName}.dll') then
-      List := List + '    ' + ObsDir + '\obs-plugins\64bit\{#PluginName}.dll' + #13#10;
-    if DirExists(ObsDir + '\data\obs-plugins\{#LegacyPluginName}') then
-      List := List + '    ' + ObsDir + '\data\obs-plugins\{#LegacyPluginName}\' + #13#10;
-    if DirExists(ObsDir + '\data\obs-plugins\{#PluginName}') then
-      List := List + '    ' + ObsDir + '\data\obs-plugins\{#PluginName}\' + #13#10;
+    Result := 0;
+    Exit;
   end;
 
-  Result := List;
+  Candidates[0] := ObsDir + '\obs-plugins\64bit\{#LegacyPluginName}.dll';  IsDir[0] := False;
+  Candidates[1] := ObsDir + '\obs-plugins\64bit\{#PluginName}.dll';        IsDir[1] := False;
+  Candidates[2] := ObsDir + '\data\obs-plugins\{#LegacyPluginName}';       IsDir[2] := True;
+  Candidates[3] := ObsDir + '\data\obs-plugins\{#PluginName}';             IsDir[3] := True;
+
+  for I := 0 to 3 do
+  begin
+    if IsDir[I] then
+    begin
+      if DirExists(Candidates[I]) then
+      begin
+        Paths := Paths + '    ' + Candidates[I] + '\' + #13#10;
+        Found := Found + 1;
+      end;
+    end
+    else
+    begin
+      if FileExists(Candidates[I]) then
+      begin
+        Paths := Paths + '    ' + Candidates[I] + #13#10;
+        Found := Found + 1;
+      end;
+    end;
+  end;
+
+  Result := Found;
+end;
+
+function DeleteInTreeCopies(): Boolean;
+var
+  ObsDir: String;
+  Ok: Boolean;
+begin
+  ObsDir := ObsProgramDir();
+  if ObsDir = '' then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  Ok := True;
+
+  if FileExists(ObsDir + '\obs-plugins\64bit\{#LegacyPluginName}.dll') then
+    if not DeleteFile(ObsDir + '\obs-plugins\64bit\{#LegacyPluginName}.dll') then Ok := False;
+  if FileExists(ObsDir + '\obs-plugins\64bit\{#PluginName}.dll') then
+    if not DeleteFile(ObsDir + '\obs-plugins\64bit\{#PluginName}.dll') then Ok := False;
+  if DirExists(ObsDir + '\data\obs-plugins\{#LegacyPluginName}') then
+    if not DelTree(ObsDir + '\data\obs-plugins\{#LegacyPluginName}', True, True, True) then Ok := False;
+  if DirExists(ObsDir + '\data\obs-plugins\{#PluginName}') then
+    if not DelTree(ObsDir + '\data\obs-plugins\{#PluginName}', True, True, True) then Ok := False;
+
+  Result := Ok;
 end;
 
 function InitializeSetup(): Boolean;
-var
-  Copies: String;
 begin
   Result := True;
 
@@ -172,25 +261,41 @@ begin
       Exit;
     end;
   end;
+end;
 
-  Copies := SystemWideCopies();
-  if Copies <> '' then
+{ Runs once, after the wizard and with Setup already elevated, before any file is
+  copied. Returning a non-empty string aborts the install and shows it. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Paths: String;
+  Choice: Integer;
+begin
+  Result := '';
+
+  if InTreeCopies(Paths) = 0 then
+    Exit;
+
+  Choice := MsgBox('A copy of this plugin is also installed inside OBS''s own program folder:' +
+                   #13#10#13#10 + Paths + #13#10 +
+                   'OBS loads every plugin folder it finds. If that copy stays, OBS runs the ' +
+                   'plugin twice - both feeds publish to the same relay path and knock each ' +
+                   'other offline every few seconds.' + #13#10#13#10 +
+                   'Remove it now?' + #13#10#13#10 +
+                   'Yes - delete the files listed above, then install (recommended).' + #13#10 +
+                   'No - leave them and install anyway.' + #13#10 +
+                   'Cancel - stop, change nothing.',
+                   mbConfirmation, MB_YESNOCANCEL);
+
+  if Choice = IDCANCEL then
   begin
-    if MsgBox('A copy of this plugin is already installed system-wide, inside OBS''s own ' +
-              'program folder:' + #13#10#13#10 +
-              Copies + #13#10 +
-              'This installer only writes to your personal OBS plugins folder, and it cannot ' +
-              'delete those files - they are in a protected location that needs administrator ' +
-              'rights.' + #13#10#13#10 +
-              'If both copies remain, OBS loads the plugin twice. The two feeds publish to the ' +
-              'same relay path and knock each other offline every few seconds.' + #13#10#13#10 +
-              'Recommended: cancel, delete the files listed above as an administrator, then run ' +
-              'this installer again.' + #13#10#13#10 +
-              'Install anyway?',
-              mbError, MB_YESNO) = IDNO then
-    begin
-      Result := False;
-      Exit;
-    end;
+    Result := 'Installation cancelled so the copy in OBS''s program folder can be removed first.';
+    Exit;
+  end;
+
+  if Choice = IDYES then
+  begin
+    if not DeleteInTreeCopies() then
+      Result := 'Could not remove the copy in OBS''s program folder. Close OBS, then run this ' +
+                'installer again - or delete those files by hand.';
   end;
 end;

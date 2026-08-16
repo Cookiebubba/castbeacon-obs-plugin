@@ -31,33 +31,63 @@ OBS performs all encoding; this plugin only asks OBS to create and configure an 
 ## Install (Windows)
 
 Download the installer from the [latest release](https://github.com/Cookiebubba/castbeacon-obs-plugin/releases)
-and run it. **Close OBS first** — the installer will ask you to.
+and run it. **Close OBS first** — the installer will ask you to. It needs
+**administrator rights** (see below).
 
-It installs to your per-user OBS plugin folder,
-`%APPDATA%\obs-studio\plugins\castbeacon`, so it needs no administrator rights.
+It installs to `C:\ProgramData\obs-studio\plugins\castbeacon`.
 
-### Upgrading from 1.2.0 or earlier
+> ⚠️ **1.3.0 installed to the wrong place.** It used
+> `%APPDATA%\obs-studio\plugins\castbeacon`, which **OBS does not scan on Windows** — the
+> plugin simply never loaded, with no error and no log line. The per-user plugin folder is
+> a macOS/Linux convention; on Windows OBS's external plugin root is `%ProgramData%`
+> (`AddExtraModulePaths()` in `frontend/widgets/OBSBasic.cpp` calls `GetProgramDataPath`
+> there, `GetAppConfigPath` everywhere else). Fixed in **1.3.1** — upgrade, and the
+> installer cleans up the misplaced folder for you.
+
+**Why administrator?** `%ProgramData%` is machine-wide. Its default permissions let a
+standard user *create* files but not overwrite or delete files another account created,
+which is exactly what an upgrade does — so the installer asks for elevation up front
+rather than working today and failing on the next upgrade.
+
+### Upgrading from 1.3.0 or earlier
 
 Version 1.3.0 renamed the module from `castpilot` to `castbeacon`. OBS loads **every**
 plugin folder it finds, so an old `castpilot` folder left alongside the new one means two
 copies of the plugin, two feeds publishing to one relay path, and a connection that drops
 every few seconds.
 
-- **Installer:** handled for you. It deletes
-  `%APPDATA%\obs-studio\plugins\castpilot` entirely before installing.
-- **Manual / zip install:** delete `%APPDATA%\obs-studio\plugins\castpilot` yourself,
-  then extract the release zip so that `castbeacon.dll` lands in
-  `%APPDATA%\obs-studio\plugins\castbeacon\bin\64bit\` and the `data` folder in
-  `%APPDATA%\obs-studio\plugins\castbeacon\data\`.
-- **A copy in OBS's own program folder** (e.g.
-  `C:\Program Files\obs-studio\obs-plugins\64bit\castpilot.dll`) causes the same double
-  load. The installer detects that and names the exact paths, but it cannot delete them —
-  that location needs administrator rights. Remove them by hand.
+The installer handles all of it. Before copying anything it deletes:
+
+- `C:\ProgramData\obs-studio\plugins\castpilot` — the one that matters. OBS scans here, so
+  a hand-made install of the old module keeps it loading alongside the new one.
+- `%APPDATA%\obs-studio\plugins\castpilot` and `...\castbeacon` — inert on Windows, but
+  1.3.0's installer left one on every machine that ran it.
+
+It also **detects a copy inside OBS's own program folder** (e.g.
+`C:\Program Files\obs-studio\obs-plugins\64bit\castpilot.dll`), names the exact paths, and
+offers to remove it — that one causes the same double load and is the reason the installer
+needs elevation anyway.
+
+### Installing from the zip instead
+
+Delete `C:\ProgramData\obs-studio\plugins\castpilot` and
+`%APPDATA%\obs-studio\plugins\{castpilot,castbeacon}` **first**, then extract the release
+zip so you end up with:
+
+```
+C:\ProgramData\obs-studio\plugins\castbeacon\bin\64bit\castbeacon.dll
+C:\ProgramData\obs-studio\plugins\castbeacon\data\
+```
+
+Confirm it worked: OBS's log should contain `[castbeacon] loaded (v1.3.1)`. If the log
+mentions `castbeacon` nowhere at all, the files are somewhere OBS does not scan.
 
 **Do not delete `%APPDATA%\obs-studio\plugin_config\castpilot\settings.json`.** That is
 the app's settings file, not a leftover: Cast Beacon 2.1.1 and older write only to that
 path, and the renamed plugin still reads it as a fallback. Removing it resets your
-overflow encode settings.
+overflow encode settings. (Settings genuinely do live under `%APPDATA%` — OBS derives
+that folder from the module's *file name*, not from where the DLL sits, so moving the
+install to `ProgramData` does not move the settings.)
 
 ## Settings
 
