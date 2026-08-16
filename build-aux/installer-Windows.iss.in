@@ -1,0 +1,49 @@
+; Inno Setup script for the Windows x64 plugin installer.
+;
+; This is a template: .github/scripts/Package-Windows.ps1 substitutes the @TOKEN@
+; placeholders and compiles the result with ISCC. Do not run ISCC on this file directly.
+;
+; The plugin is installed into the per-user OBS plugin directory
+; (%APPDATA%\obs-studio\plugins\<plugin>) which OBS 28 and newer scan on startup.
+; That location needs no administrator rights and no OBS install-path detection,
+; and it matches the directory layout CMake already stages into release/<config>.
+
+#define PluginName        "@PLUGIN_NAME@"
+#define PluginDisplayName "@PLUGIN_DISPLAY_NAME@"
+#define PluginVersion     "@PLUGIN_VERSION@"
+#define PluginAuthor      "@PLUGIN_AUTHOR@"
+#define PayloadDir        "@PAYLOAD_DIR@"
+
+[Setup]
+; Keep this GUID stable across releases so upgrades replace rather than stack.
+AppId={{113E453B-E0EA-45A3-AABD-BF093378B668}
+AppName={#PluginDisplayName}
+AppVersion={#PluginVersion}
+AppVerName={#PluginDisplayName} {#PluginVersion}
+AppPublisher={#PluginAuthor}
+VersionInfoVersion={#PluginVersion}
+VersionInfoCompany={#PluginAuthor}
+VersionInfoDescription={#PluginDisplayName} installer
+DefaultDirName={userappdata}\obs-studio\plugins\{#PluginName}
+UninstallDisplayName={#PluginDisplayName} {#PluginVersion}
+; The install location is fixed by OBS convention - letting the user move it
+; would simply produce a plugin OBS never loads.
+DisableDirPage=yes
+DisableProgramGroupPage=yes
+PrivilegesRequired=lowest
+OutputDir=@OUTPUT_DIR@
+OutputBaseFilename=@OUTPUT_BASENAME@
+Compression=lzma2
+SolidCompression=yes
+WizardStyle=modern
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Files]
+Source: "{#PayloadDir}\bin\64bit\{#PluginName}.dll"; DestDir: "{app}\bin\64bit"; Flags: ignoreversion
+Source: "{#PayloadDir}\data\*"; DestDir: "{app}\data"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}\bin"
+Type: filesandordirs; Name: "{app}\data"
