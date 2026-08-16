@@ -60,6 +60,25 @@ function(_setup_obs_studio)
     set(_cmake_generator "Xcode")
     set(_cmake_arch "-DCMAKE_OSX_ARCHITECTURES:STRING='arm64;x86_64'")
     set(_cmake_extra "-DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+
+    # OBS source archives up to 32.1.2 ship the Swift-based libobs-metal target
+    # without enabling the Swift language (fixed upstream in obs-studio#13250),
+    # so configuring them fails with "can not determine linker language".
+    if(_obs_version VERSION_LESS_EQUAL 32.1.2)
+      set(_metal_cmakelists "${dependencies_dir}/${_obs_destination}/libobs-metal/CMakeLists.txt")
+      file(READ "${_metal_cmakelists}" _metal_contents)
+      if(NOT _metal_contents MATCHES "enable_language\\(Swift\\)")
+        message(STATUS "Patching libobs-metal to enable Swift")
+        string(
+          REPLACE
+          "add_library(libobs-metal SHARED)"
+          "enable_language(Swift)\n\nadd_library(libobs-metal SHARED)"
+          _metal_contents
+          "${_metal_contents}"
+        )
+        file(WRITE "${_metal_cmakelists}" "${_metal_contents}")
+      endif()
+    endif()
   endif()
 
   message(STATUS "Configure ${label} (${arch})")
