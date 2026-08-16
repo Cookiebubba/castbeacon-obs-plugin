@@ -99,12 +99,6 @@ Type: filesandordirs; Name: "{app}\bin"
 Type: filesandordirs; Name: "{app}\data"
 Type: files; Name: "{app}\unins*.*"
 
-[Registry]
-; 1.3.0 installed per-user, so its Add/Remove entry lives in HKCU and an elevated
-; (HKLM) install will not replace it - it would dangle, pointing at the folder deleted
-; above. Same AppId, so this one key covers both 1.2.0 and 1.3.0.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{{{#AppGuidBare}}_is1"; ValueType: none; Flags: deletekey
-
 [Files]
 Source: "{#PayloadDir}\bin\64bit\{#PluginName}.dll"; DestDir: "{app}\bin\64bit"; Flags: ignoreversion
 Source: "{#PayloadDir}\data\*"; DestDir: "{app}\data"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -116,16 +110,27 @@ Type: filesandordirs; Name: "{app}\bin"
 Type: filesandordirs; Name: "{app}\data"
 Type: dirifempty; Name: "{app}"
 
+
 [Code]
 { ---------------------------------------------------------------------------
-  Pre-install checks. Two ways an upgrade can leave OBS loading two modules:
+  Three things [InstallDelete] cannot express.
 
   1. OBS is open, so the old DLL is locked and the cleanup half-fails.
-  2. Someone hand-copied the plugin into OBS's own program folder. [InstallDelete]
-     covers the two plugin roots OBS scans; it cannot cover an in-tree copy, because
-     that path is not knowable at compile time. So find it, name it, and - now that
-     Setup runs elevated - offer to remove it instead of only complaining.
+  2. A stale per-user Add/Remove entry from 1.3.0. That install was not elevated,
+     so its entry sits in HKCU while this one writes HKLM - Setup will not replace
+     it, and it would be left pointing at a folder that no longer exists.
+  3. A hand-copied plugin inside OBS's own program folder. That path is not
+     knowable at compile time, so it has to be looked up and deleted in code.
+
+  Newlines go through the NL constant on purpose: the preprocessor reads a line
+  whose first non-blank character is a hash as a directive, so a wrapped string
+  continuation starting with a character escape will not compile.
   --------------------------------------------------------------------------- }
+
+const
+  NL = #13#10;
+  { Inno derives its uninstall key from AppId plus an _is1 suffix - keep in step. }
+  UninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#AppGuidBare}}_is1';
 
 function IsObsRunning(): Boolean;
 var
@@ -138,7 +143,7 @@ begin
     Items := Service.ExecQuery('SELECT ProcessId FROM Win32_Process WHERE Name = "obs64.exe"');
     Result := Items.Count > 0;
   except
-    { WMI unavailable (locked down box). Don't invent a state - fall through and let
+    { WMI unavailable (locked down box). Do not invent a state - fall through and let
       Inno's own in-use file detection handle whatever it can. }
     Result := False;
   end;
@@ -171,75 +176,55 @@ begin
     Result := ExpandConstant('{commonpf32}\obs-studio');
 end;
 
-{ Copies of either module name sitting inside OBS's own program folder. Count is
-  returned; Paths is filled with one path per line for display. }
-function InTreeCopies(var Paths: String): Integer;
+{ Copies of either module name inside OBS's own program folder, one indented path
+  per line. Empty string means there are none. }
+function InTreeList(): String;
 var
-  ObsDir: String;
-  Candidates: array[0..3] of String;
-  IsDir: array[0..3] of Boolean;
-  I, Found: Integer;
+  ObsDir, L: String;
 begin
-  Paths := '';
-  Found := 0;
-
+  L := '';
   ObsDir := ObsProgramDir();
-  if ObsDir = '' then
+
+  if ObsDir <> '' then
   begin
-    Result := 0;
-    Exit;
+    if FileExists(ObsDir + '\obs-plugins\64bit\{#LegacyPluginName}.dll') then
+      L := L + '    ' + ObsDir + '\obs-plugins\64bit\{#LegacyPluginName}.dll' + NL;
+    if FileExists(ObsDir + '\obs-plugins\64bit\{#PluginName}.dll') then
+      L := L + '    ' + ObsDir + '\obs-plugins\64bit\{#PluginName}.dll' + NL;
+    if DirExists(ObsDir + '\data\obs-plugins\{#LegacyPluginName}') then
+      L := L + '    ' + ObsDir + '\data\obs-plugins\{#LegacyPluginName}\' + NL;
+    if DirExists(ObsDir + '\data\obs-plugins\{#PluginName}') then
+      L := L + '    ' + ObsDir + '\data\obs-plugins\{#PluginName}\' + NL;
   end;
 
-  Candidates[0] := ObsDir + '\obs-plugins\64bit\{#LegacyPluginName}.dll';  IsDir[0] := False;
-  Candidates[1] := ObsDir + '\obs-plugins\64bit\{#PluginName}.dll';        IsDir[1] := False;
-  Candidates[2] := ObsDir + '\data\obs-plugins\{#LegacyPluginName}';       IsDir[2] := True;
-  Candidates[3] := ObsDir + '\data\obs-plugins\{#PluginName}';             IsDir[3] := True;
-
-  for I := 0 to 3 do
-  begin
-    if IsDir[I] then
-    begin
-      if DirExists(Candidates[I]) then
-      begin
-        Paths := Paths + '    ' + Candidates[I] + '\' + #13#10;
-        Found := Found + 1;
-      end;
-    end
-    else
-    begin
-      if FileExists(Candidates[I]) then
-      begin
-        Paths := Paths + '    ' + Candidates[I] + #13#10;
-        Found := Found + 1;
-      end;
-    end;
-  end;
-
-  Result := Found;
+  Result := L;
 end;
 
-function DeleteInTreeCopies(): Boolean;
+{ Only ever touches the two exact file names this project owns - never anything else
+  in OBS's plugin folder. }
+function DeleteInTree(): Boolean;
 var
   ObsDir: String;
   Ok: Boolean;
 begin
-  ObsDir := ObsProgramDir();
-  if ObsDir = '' then
-  begin
-    Result := True;
-    Exit;
-  end;
-
   Ok := True;
+  ObsDir := ObsProgramDir();
 
-  if FileExists(ObsDir + '\obs-plugins\64bit\{#LegacyPluginName}.dll') then
-    if not DeleteFile(ObsDir + '\obs-plugins\64bit\{#LegacyPluginName}.dll') then Ok := False;
-  if FileExists(ObsDir + '\obs-plugins\64bit\{#PluginName}.dll') then
-    if not DeleteFile(ObsDir + '\obs-plugins\64bit\{#PluginName}.dll') then Ok := False;
-  if DirExists(ObsDir + '\data\obs-plugins\{#LegacyPluginName}') then
-    if not DelTree(ObsDir + '\data\obs-plugins\{#LegacyPluginName}', True, True, True) then Ok := False;
-  if DirExists(ObsDir + '\data\obs-plugins\{#PluginName}') then
-    if not DelTree(ObsDir + '\data\obs-plugins\{#PluginName}', True, True, True) then Ok := False;
+  if ObsDir <> '' then
+  begin
+    if FileExists(ObsDir + '\obs-plugins\64bit\{#LegacyPluginName}.dll') then
+      if not DeleteFile(ObsDir + '\obs-plugins\64bit\{#LegacyPluginName}.dll') then
+        Ok := False;
+    if FileExists(ObsDir + '\obs-plugins\64bit\{#PluginName}.dll') then
+      if not DeleteFile(ObsDir + '\obs-plugins\64bit\{#PluginName}.dll') then
+        Ok := False;
+    if DirExists(ObsDir + '\data\obs-plugins\{#LegacyPluginName}') then
+      if not DelTree(ObsDir + '\data\obs-plugins\{#LegacyPluginName}', True, True, True) then
+        Ok := False;
+    if DirExists(ObsDir + '\data\obs-plugins\{#PluginName}') then
+      if not DelTree(ObsDir + '\data\obs-plugins\{#PluginName}', True, True, True) then
+        Ok := False;
+  end;
 
   Result := Ok;
 end;
@@ -250,8 +235,8 @@ begin
 
   while IsObsRunning() do
   begin
-    if MsgBox('OBS Studio is running.' + #13#10#13#10 +
-              'Close OBS completely, then click Retry.' + #13#10#13#10 +
+    if MsgBox('OBS Studio is running.' + NL + NL +
+              'Close OBS completely, then click Retry.' + NL + NL +
               'Installing while OBS is open leaves the previous plugin file locked, so the ' +
               'upgrade only half-applies - and OBS can end up loading two copies of the plugin, ' +
               'which fight over the relay connection.',
@@ -272,17 +257,23 @@ var
 begin
   Result := '';
 
-  if InTreeCopies(Paths) = 0 then
+  { Best-effort: if Setup was elevated with a different account this is that account's
+    hive, and the stale entry survives. It is cosmetic - the folder it points at is
+    gone either way. }
+  RegDeleteKeyIncludingSubkeys(HKEY_CURRENT_USER, UninstallKey);
+
+  Paths := InTreeList();
+  if Paths = '' then
     Exit;
 
   Choice := MsgBox('A copy of this plugin is also installed inside OBS''s own program folder:' +
-                   #13#10#13#10 + Paths + #13#10 +
+                   NL + NL + Paths + NL +
                    'OBS loads every plugin folder it finds. If that copy stays, OBS runs the ' +
                    'plugin twice - both feeds publish to the same relay path and knock each ' +
-                   'other offline every few seconds.' + #13#10#13#10 +
-                   'Remove it now?' + #13#10#13#10 +
-                   'Yes - delete the files listed above, then install (recommended).' + #13#10 +
-                   'No - leave them and install anyway.' + #13#10 +
+                   'other offline every few seconds.' + NL + NL +
+                   'Remove it now?' + NL + NL +
+                   'Yes - delete the files listed above, then install (recommended).' + NL +
+                   'No - leave them in place and install anyway.' + NL +
                    'Cancel - stop, change nothing.',
                    mbConfirmation, MB_YESNOCANCEL);
 
@@ -293,9 +284,7 @@ begin
   end;
 
   if Choice = IDYES then
-  begin
-    if not DeleteInTreeCopies() then
+    if not DeleteInTree() then
       Result := 'Could not remove the copy in OBS''s program folder. Close OBS, then run this ' +
                 'installer again - or delete those files by hand.';
-  end;
 end;
