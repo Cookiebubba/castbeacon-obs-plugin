@@ -1,7 +1,7 @@
 /*
- * CastPilot Bridge — OBS plugin (GPLv2).
+ * Cast Beacon OBS Plugin (GPLv2).
  *
- * Adds a hidden second output that pushes OBS's program to CastPilot's local relay over RTMP
+ * Adds a hidden second output that pushes OBS's program to Cast Beacon's local relay over RTMP
  * (rtmp://127.0.0.1:1935/service). From there the relay (mediamtx) fans it out as HLS to the
  * Chromecast overflow TVs, and go2rtc reads the same RTMP and serves the operator's low-latency
  * monitor over MSE-over-WebSocket. RTMP is plain TCP, so the publish is rock-solid.
@@ -9,7 +9,7 @@
  * The overflow feed gets its OWN video encoder with a low keyframe interval (default 1s) so the
  * TVs + monitor run at low latency INDEPENDENT of your broadcast (which keeps its own
  * keyframe/quality for Twitch/Facebook). Optionally it runs at its own bitrate/resolution, read
- * from <module-config>/settings.json (written by the CastPilot app). Audio is shared with the
+ * from <module-config>/settings.json (written by the Cast Beacon app). Audio is shared with the
  * broadcast (audio has no keyframe), so this is one extra video encode.
  *
  * OBS performs all encoding — this plugin only asks OBS to create/configure an encoder.
@@ -41,13 +41,58 @@ static obs_output_t *shadow_output = NULL;
 static obs_service_t *shadow_service = NULL;
 static obs_encoder_t *local_venc = NULL; /* our dedicated low-latency encoder */
 
-/* Independent overflow-feed settings, written by the CastPilot app to
- * <module config>/settings.json. Missing file or 0 values fall back to defaults:
+/* THE SETTINGS CONTRACT (app -> plugin), and why there are two paths.
+ *
+ * OBS derives a module's config directory from the module's BINARY NAME, so this plugin reads
+ *   %APPDATA%\obs-studio\plugin_config\castbeacon\settings.json
+ * and everything before the 1.2.0 -> 1.3.0 rename read
+ *   %APPDATA%\obs-studio\plugin_config\castpilot\settings.json
+ *
+ * The app is the writer and it ships on its own schedule: Cast Beacon 2.1.1 and older know only
+ * the legacy path. So the read order is NEW FIRST, LEGACY AS FALLBACK — a 1.3.0 plugin under an
+ * old app still gets its settings, and the moment a dual-writing app appears the new file wins
+ * with no user action. The legacy file is never written, never deleted, and never merged: it is
+ * a whole-file fallback, so a present-but-empty new file legitimately means "defaults", not
+ * "go look at the old one".
+ *
+ * REMOVAL CONDITION: drop the fallback once the app enforces a plugin-version floor of 1.3.0
+ * (at which point the app can stop dual-writing too). Until then both halves must stay.
+ *
+ * Keys (all optional; missing file or 0 values fall back to defaults):
  *   keyint_sec   : keyframe interval in seconds (default 1 = low latency)
  *   bitrate_kbps : 0 -> match the broadcast encoder's bitrate
  *   width,height : 0 -> match the canvas (no rescale)
  *   shadow_enabled : absent/true -> normal; false -> never start the shadow output (manual
  *                    escape hatch for operators who drive the relay some other way) */
+#define LEGACY_MODULE_NAME "castpilot"
+
+/* Swap the module-name segment of an OBS module-config path for the legacy one, i.e.
+ * ".../plugin_config/<module>/settings.json" -> ".../plugin_config/castpilot/settings.json".
+ * Derived from the path OBS actually handed us rather than rebuilt from scratch, so it follows
+ * OBS's own config root on every platform. Caller bfree()s the result. */
+static char *legacy_config_path(const char *modern)
+{
+	if (!modern)
+		return NULL;
+
+	/* libobs joins these segments with '/' on every platform, whatever the root looks like. */
+	const char *file = strrchr(modern, '/');
+	if (!file || file == modern)
+		return NULL;
+
+	const char *seg = file - 1;
+	while (seg > modern && *seg != '/')
+		seg--;
+	if (*seg != '/')
+		return NULL;
+
+	struct dstr out = {0};
+	dstr_ncopy(&out, modern, (size_t)(seg - modern) + 1); /* up to and including that '/' */
+	dstr_cat(&out, LEGACY_MODULE_NAME);
+	dstr_cat(&out, file); /* "/settings.json" */
+	return out.array;
+}
+
 static void load_local_cfg(int *keyint, int *bitrate_kbps, int *width, int *height, int *fps, bool *shadow_enabled)
 {
 	*keyint = 1;
@@ -61,6 +106,16 @@ static void load_local_cfg(int *keyint, int *bitrate_kbps, int *width, int *heig
 	if (!path)
 		return;
 	obs_data_t *d = obs_data_create_from_json_file(path);
+	if (!d) {
+		char *legacy = legacy_config_path(path);
+		if (legacy) {
+			d = obs_data_create_from_json_file(legacy);
+			if (d)
+				obs_log(LOG_INFO, "settings: read the pre-rename file %s (upgrade the app to move it)",
+					legacy);
+			bfree(legacy);
+		}
+	}
 	bfree(path);
 	if (!d)
 		return;
@@ -71,7 +126,7 @@ static void load_local_cfg(int *keyint, int *bitrate_kbps, int *width, int *heig
 	*width = (int)obs_data_get_int(d, "width");
 	*height = (int)obs_data_get_int(d, "height");
 	/* fps: absolute target framerate for the overflow feed (0 = match canvas).
-	 * The CastPilot app writes an absolute value (60/30/24/15); the encoder can
+	 * The Cast Beacon app writes an absolute value (60/30/24/15); the encoder can
 	 * only run at an integer divisor of the canvas fps, so start_shadow snaps it. */
 	*fps = (int)obs_data_get_int(d, "fps");
 	if (*fps < 0 || *fps > 240) /* sanity bound against a corrupt config */
@@ -219,17 +274,17 @@ static void start_shadow(void)
 			obs_data_set_int(settings, "bitrate", bitrate);
 			obs_data_set_int(settings, "max_bitrate", bitrate);
 		}
-		local_venc = obs_video_encoder_create(enc_id ? enc_id : "obs_x264", "castpilot_venc", settings, NULL);
+		local_venc = obs_video_encoder_create(enc_id ? enc_id : "obs_x264", "castbeacon_venc", settings, NULL);
 		obs_data_release(settings);
 	}
 
 	obs_data_t *svc = obs_data_create();
 	obs_data_set_string(svc, "server", SHADOW_SERVER);
 	obs_data_set_string(svc, "key", SHADOW_KEY);
-	shadow_service = obs_service_create("rtmp_custom", "castpilot_service", svc, NULL);
+	shadow_service = obs_service_create("rtmp_custom", "castbeacon_service", svc, NULL);
 	obs_data_release(svc);
 
-	shadow_output = obs_output_create("rtmp_output", "castpilot_shadow", NULL, NULL);
+	shadow_output = obs_output_create("rtmp_output", "castbeacon_shadow", NULL, NULL);
 	obs_output_set_service(shadow_output, shadow_service);
 	obs_output_set_audio_encoder(shadow_output, aenc, 0); /* share audio - no keyframe there */
 
@@ -296,6 +351,18 @@ static void on_frontend_event(enum obs_frontend_event event, void *data)
 	default:
 		break;
 	}
+}
+
+/* OBS shows these in its module listing / log. The plugin has no other user-facing text —
+ * there is no UI, no menu entry and no settings pane. */
+MODULE_EXPORT const char *obs_module_name(void)
+{
+	return obs_module_text("Name");
+}
+
+MODULE_EXPORT const char *obs_module_description(void)
+{
+	return obs_module_text("Description");
 }
 
 bool obs_module_load(void)

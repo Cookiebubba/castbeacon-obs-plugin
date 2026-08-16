@@ -33,13 +33,13 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.castpilot.bridge"
+            "bundleId": "com.castbeacon.bridge"
         }
     },
-    "name": "castpilot",
-    "displayName": "CastPilot Bridge",
-    "version": "1.2.0",
-    "author": "CastPilot",
-    "website": "https://example.com",
-    "email": "me@example.com"
+    "name": "castbeacon",
+    "displayName": "Cast Beacon OBS Plugin",
+    "version": "1.3.0",
+    "author": "Cast Beacon",
+    "website": "https://github.com/Cookiebubba/castbeacon-obs-plugin",
+    "email": "support@castbeacon.com"
 }
