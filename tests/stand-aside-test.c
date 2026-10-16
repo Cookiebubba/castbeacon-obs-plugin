@@ -67,6 +67,13 @@ static struct cb_decision decide_rs(const char *server, const char *key, enum cb
 	return d;
 }
 
+/* For messages: a macro argument must never meet `?:` itself - a string literal there is a literal
+ * tested as a bool (clang -Wstring-conversion). */
+static const char *or_null(const char *s)
+{
+	return s ? s : "(null)";
+}
+
 static struct cb_decision decide(const char *server, const char *key)
 {
 	return decide_rs(server, key, CB_RESOLVE_NOT_TRIED, NULL, 0);
@@ -76,8 +83,8 @@ static struct cb_decision decide(const char *server, const char *key)
 	do {                                                                                          \
 		struct cb_decision d_ = decide(server, key);                                          \
 		CHECK(d_.verdict == (want_verdict) && d_.host == (want_host),                         \
-		      "%s + key \"%s\": got verdict %d (%s) host %d (%s), want %d host %d", server ? server : "(null)", \
-		      key ? key : "(null)", d_.verdict, cb_verdict_text(d_.verdict), d_.host,           \
+		      "%s + key \"%s\": got verdict %d (%s) host %d (%s), want %d host %d", or_null(server), \
+		      or_null(key), d_.verdict, cb_verdict_text(d_.verdict), d_.host,           \
 		      cb_host_kind_text(d_.host), (want_verdict), (want_host));                       \
 	} while (0)
 
