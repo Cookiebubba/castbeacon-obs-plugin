@@ -1,0 +1,26 @@
+name: Unit Tests
+on:
+  workflow_call:
+jobs:
+  unit-tests:
+    name: Unit tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-15]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      # tests/ is a CMake project of its own: no libobs, no OBS plugin template, no dependencies.
+      - name: Configure
+        run: cmake -S tests -B build_tests
+
+      - name: Build
+        run: cmake --build build_tests --config Release
+
+      - name: Run
+        run: ctest --test-dir build_tests -C Release --output-on-failure

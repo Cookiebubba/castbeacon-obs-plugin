@@ -18,14 +18,21 @@
  * picks the app's service in OBS and the app fans out to the platforms). In that setup the shadow
  * output would publish to the SAME relay path as the main output, and the relay only allows one
  * publisher per path — the two outputs then kick each other loose every couple of seconds. So on
- * every stream start we look at OBS's own stream service: if it already points at our local
- * ingest, the shadow output stands down. Everything else behaves exactly as before.
+ * every stream start we look at OBS's own stream service: if it points at THIS machine (by
+ * loopback, any of its own addresses or its hostname) on the relay's RTMP port, the operator has
+ * chosen "OBS sends straight to Cast Beacon" and the shadow output stands aside - on ANY path, so it
+ * never publishes into "service" behind the operator's back (stand-aside.c holds that decision).
+ * The decision runs on a worker thread (it may need a DNS lookup), and the shadow output is only
+ * ever started from the UI thread once that decision is in (shadow-control.c).
+ * Everything else behaves exactly as before.
  */
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <plugin-support.h>
 #include <util/dstr.h>
+
+#include "shadow-control.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -35,7 +42,15 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 static const char *SHADOW_SERVER = "rtmp://127.0.0.1:1935";
 static const char *SHADOW_KEY = "service";
-#define SHADOW_PORT 1935 /* the relay's RTMP ingest port (also RTMP's default port) */
+
+/* How long the decision waits on a host-name lookup before answering "stand aside, for now" (the
+ * shadow starts only if the late answer says another machine). A lookup is made only when the name
+ * is neither loopback nor this machine's hostname AND the output's port is the relay's. It runs on a
+ * worker thread, never the UI. */
+#define DECISION_TIMEBOX_MS 3000
+
+/* How long unload waits for decisions still running before it pins the module and leaves them. */
+#define UNLOAD_WAIT_MS 2000
 
 static obs_output_t *shadow_output = NULL;
 static obs_service_t *shadow_service = NULL;
@@ -136,74 +151,6 @@ static void load_local_cfg(int *keyint, int *bitrate_kbps, int *width, int *heig
 	obs_data_release(d);
 }
 
-/* Does this RTMP URL address our own local ingest? Compared structurally (host + port only) so
- * rtmp:// vs rtmps://, an app path or trailing slashes, a user:pass@ prefix and an omitted
- * (default) port all still match. */
-static bool url_is_local_ingest(const char *url)
-{
-	if (!url || !*url)
-		return false;
-
-	const char *sep = strstr(url, "://");
-	const char *p = sep ? sep + 3 : url;
-
-	char auth[256];
-	size_t n = strcspn(p, "/?"); /* the authority ends at the path or query */
-	if (n == 0 || n >= sizeof(auth))
-		return false;
-	memcpy(auth, p, n);
-	auth[n] = '\0';
-
-	char *host = auth;
-	char *at = strrchr(auth, '@'); /* drop any credentials */
-	if (at)
-		host = at + 1;
-
-	const char *port = NULL;
-	if (*host == '[') { /* bracketed IPv6 literal: [::1]:1935 */
-		char *end = strchr(host, ']');
-		if (!end)
-			return false;
-		*end = '\0';
-		host++;
-		if (end[1] == ':')
-			port = end + 2;
-	} else {
-		char *colon = strchr(host, ':');
-		if (colon) {
-			*colon = '\0';
-			port = colon + 1;
-		}
-	}
-
-	if ((port && *port ? atoi(port) : SHADOW_PORT) != SHADOW_PORT)
-		return false;
-
-	return astrcmpi(host, "127.0.0.1") == 0 || astrcmpi(host, "localhost") == 0 || astrcmpi(host, "::1") == 0;
-}
-
-/* True when OBS's own stream output already publishes to our relay, i.e. the app is downstream of
- * the broadcast and a shadow output would just fight it for the path. Re-read on every stream
- * start, since the operator can switch services between streams. */
-static bool main_output_feeds_us(void)
-{
-	obs_service_t *svc = obs_frontend_get_streaming_service(); /* borrowed ref - do not release */
-	if (!svc)
-		return false;
-
-	const char *url = obs_service_get_connect_info(svc, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
-	if (url && *url)
-		return url_is_local_ingest(url);
-
-	/* Service types that don't implement get_connect_info: read the raw setting instead. */
-	obs_data_t *settings = obs_service_get_settings(svc);
-	if (!settings)
-		return false;
-	bool hit = url_is_local_ingest(obs_data_get_string(settings, "server"));
-	obs_data_release(settings);
-	return hit;
-}
-
 static void stop_shadow(void)
 {
 	if (shadow_output) {
@@ -221,7 +168,9 @@ static void stop_shadow(void)
 	}
 }
 
-static void start_shadow(void)
+/* Build and start the shadow output. UI thread only, and only once the main output check has said
+ * the shadow should run (apply_verdict), or when there is nothing to check. */
+static void start_shadow_now(void)
 {
 	if (shadow_output)
 		return; /* already running */
@@ -236,11 +185,6 @@ static void start_shadow(void)
 		obs_log(LOG_INFO, "overflow feed disabled in settings - shadow output standing down");
 		return;
 	}
-	if (main_output_feeds_us()) {
-		obs_log(LOG_INFO, "main output already feeds Cast Beacon - shadow output standing down");
-		return;
-	}
-
 	obs_output_t *stream = obs_frontend_get_streaming_output();
 	if (!stream) {
 		obs_log(LOG_WARNING, "no streaming output; cannot start the overflow feed");
@@ -337,22 +281,111 @@ static void start_shadow(void)
 	obs_output_release(stream); /* frontend get returns a new ref */
 }
 
+/* ------------------------------------------------------------------ The main output check
+ *
+ * The state machine lives in shadow-control.c (libobs-free, unit-tested). Here it gets OBS's side:
+ * start/stop the shadow, post to the UI thread, log. Its decider threads never touch libobs. */
+
+static void ctl_start_shadow(void *ctx)
+{
+	(void)ctx;
+	start_shadow_now();
+}
+
+static void ctl_stop_shadow(void *ctx)
+{
+	(void)ctx;
+	stop_shadow();
+}
+
+static bool ctl_shadow_running(void *ctx)
+{
+	(void)ctx;
+	return shadow_output != NULL;
+}
+
+static void ctl_post_ui(void *ctx, void (*task)(void *arg), void *arg)
+{
+	(void)ctx;
+	obs_queue_task(OBS_TASK_UI, task, arg, false);
+}
+
+static void ctl_log(void *ctx, enum cb_log_level level, const char *line)
+{
+	(void)ctx;
+	obs_log(level == CB_LOG_WARNING ? LOG_WARNING : LOG_INFO, "%s", line);
+}
+
+/* OBS's own stream service as copies of its server URL and key (both bfree()d by the caller).
+ * False when OBS has no stream service. */
+static bool read_main_output(char **server, char **key)
+{
+	obs_service_t *svc = obs_frontend_get_streaming_service(); /* borrowed ref - do not release */
+	if (!svc)
+		return false;
+
+	const char *url = obs_service_get_connect_info(svc, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
+	const char *k = obs_service_get_connect_info(svc, OBS_SERVICE_CONNECT_INFO_STREAM_KEY);
+
+	/* Service types that don't implement get_connect_info: read the raw settings instead. */
+	obs_data_t *settings = NULL;
+	if (!url || !*url || !k) {
+		settings = obs_service_get_settings(svc);
+		if (settings) {
+			if (!url || !*url)
+				url = obs_data_get_string(settings, "server");
+			if (!k)
+				k = obs_data_get_string(settings, "key");
+		}
+	}
+
+	*server = bstrdup(url ? url : "");
+	*key = bstrdup(k ? k : "");
+	obs_data_release(settings);
+	return true;
+}
+
+/* STREAMING_STARTED. UI thread. */
+static void begin_shadow(void)
+{
+	int keyint, bitrate, width, height, fps;
+	bool shadow_enabled;
+	load_local_cfg(&keyint, &bitrate, &width, &height, &fps, &shadow_enabled);
+	if (!shadow_enabled) {
+		cb_ctl_stream_stopped(); /* nothing from an earlier start may run on */
+		obs_log(LOG_INFO, "overflow feed disabled in settings - shadow output standing down");
+		return;
+	}
+
+	char *server = NULL, *key = NULL;
+	if (read_main_output(&server, &key))
+		cb_ctl_stream_started(server, key);
+	else
+		cb_ctl_stream_started(NULL, NULL);
+	bfree(server);
+	bfree(key);
+}
+
 static void on_frontend_event(enum obs_frontend_event event, void *data)
 {
 	(void)data;
 	switch (event) {
 	case OBS_FRONTEND_EVENT_STREAMING_STARTED:
-		start_shadow();
+		begin_shadow();
 		break;
 	case OBS_FRONTEND_EVENT_STREAMING_STOPPING:
-		/* Stop BEFORE OBS frees the shared audio encoder (mandatory order). */
-		stop_shadow();
+	case OBS_FRONTEND_EVENT_STREAMING_STOPPED:
+		/* STOPPING: stop BEFORE OBS frees the shared audio encoder (mandatory order).
+		 * STOPPED: the same again, harmlessly - a stream that failed may skip STOPPING. */
+		cb_ctl_stream_stopped();
+		break;
+	case OBS_FRONTEND_EVENT_EXIT:
+		cb_ctl_exit(); /* from here on nothing is posted to the UI: it is going away */
 		break;
 	default:
 		break;
 	}
 }
-
 /* OBS shows these in its module listing / log. The plugin has no other user-facing text —
  * there is no UI, no menu entry and no settings pane. */
 MODULE_EXPORT const char *obs_module_name(void)
@@ -367,6 +400,20 @@ MODULE_EXPORT const char *obs_module_description(void)
 
 bool obs_module_load(void)
 {
+	struct cb_ctl_ops ops = {0};
+	ops.start_shadow = ctl_start_shadow;
+	ops.stop_shadow = ctl_stop_shadow;
+	ops.shadow_running = ctl_shadow_running;
+	ops.post_ui = ctl_post_ui;
+	ops.log = ctl_log;
+	ops.relay_server = SHADOW_SERVER;
+	ops.relay_key = SHADOW_KEY;
+	ops.timebox_ms = DECISION_TIMEBOX_MS;
+	ops.unload_wait_ms = UNLOAD_WAIT_MS;
+	if (!cb_ctl_init(&ops)) {
+		obs_log(LOG_WARNING, "could not create a lock - overflow feed unavailable");
+		return false;
+	}
 	obs_frontend_add_event_callback(on_frontend_event, NULL);
 	obs_log(LOG_INFO, "loaded (v%s) - overflow feed ready", PLUGIN_VERSION);
 	return true;
@@ -374,7 +421,9 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+	cb_ctl_exit();
 	stop_shadow();
 	obs_frontend_remove_event_callback(on_frontend_event, NULL);
+	cb_ctl_shutdown(); /* waits for deciders; pins the module if one is stuck */
 	obs_log(LOG_INFO, "unloaded");
 }
