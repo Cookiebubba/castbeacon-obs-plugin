@@ -1,5 +1,5 @@
-# Unit tests for the plugin's pure logic. A project of its OWN, deliberately: it needs neither libobs
-# nor the OBS plugin template, so it builds anywhere a C compiler does.
+# Unit tests for the plugin's libobs-free code. A project of its OWN, deliberately: it needs neither
+# libobs nor the OBS plugin template, so it builds anywhere a C compiler does.
 #
 #   cmake -S tests -B build_tests
 #   cmake --build build_tests --config Release
@@ -12,18 +12,36 @@ project(castbeacon-tests LANGUAGES C)
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED TRUE)
 
+find_package(Threads REQUIRED)
+
 enable_testing()
 
-add_executable(stand-aside-test stand-aside-test.c ../src/stand-aside.c)
-target_include_directories(stand-aside-test PRIVATE ../src)
+function(castbeacon_test name)
+  add_executable(${name} ${ARGN})
+  target_include_directories(${name} PRIVATE ../src)
+  if(MSVC)
+    target_compile_options(${name} PRIVATE /W4 /WX)
+  else()
+    target_compile_options(
+      ${name}
+      PRIVATE -Wall -Wextra -Werror -Wshadow -Wconversion -Wno-sign-conversion
+    )
+  endif()
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
 
-if(MSVC)
-  target_compile_options(stand-aside-test PRIVATE /W4 /WX)
-else()
-  target_compile_options(
-    stand-aside-test
-    PRIVATE -Wall -Wextra -Werror -Wshadow -Wconversion -Wno-sign-conversion
-  )
+# The decision itself: pure, no OS calls.
+castbeacon_test(stand-aside-test stand-aside-test.c ../src/stand-aside.c)
+
+# The threaded lookup and the decision end to end, against a fake resolver.
+castbeacon_test(
+  local-host-test
+  local-host-test.c
+  ../src/local-host.c
+  ../src/cb-thread.c
+  ../src/stand-aside.c
+)
+target_link_libraries(local-host-test PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+if(WIN32)
+  target_link_libraries(local-host-test PRIVATE iphlpapi ws2_32)
 endif()
-
-add_test(NAME stand-aside COMMAND stand-aside-test)

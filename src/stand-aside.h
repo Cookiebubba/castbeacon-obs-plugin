@@ -39,7 +39,8 @@ struct cb_url {
 	int port;               /* the explicit port, else the scheme's default; 0 when unknown */
 	char path[CB_PATH_MAX]; /* the relay path it publishes to: URL path + "/" + key, query
 	                         * dropped, slashes collapsed and trimmed. Holds the stream key -
-	                         * NEVER log it. */
+	                         * NEVER log it. Empty when !path_known. */
+	bool path_known;        /* false when the path is too long to hold: then it never matches */
 	bool host_is_ip;
 	struct cb_addr ip; /* valid when host_is_ip */
 };
@@ -62,6 +63,7 @@ enum cb_resolve {
 enum cb_host_kind {
 	CB_HOST_UNPARSEABLE,
 	CB_HOST_LOOPBACK,       /* 127.0.0.0/8, ::1, localhost */
+	CB_HOST_UNSPECIFIED,    /* 0.0.0.0 or :: - as a destination, they reach this machine */
 	CB_HOST_LOCAL_ADDR,     /* one of this machine's interface addresses */
 	CB_HOST_HOSTNAME,       /* this machine's own hostname */
 	CB_HOST_RESOLVES_LOCAL, /* a name that resolved to an address of this machine */
@@ -91,6 +93,7 @@ struct cb_decision {
 bool cb_parse_ip(const char *s, size_t len, struct cb_addr *out);
 
 bool cb_addr_is_loopback(const struct cb_addr *a);
+bool cb_addr_is_unspecified(const struct cb_addr *a);
 bool cb_addr_equal(const struct cb_addr *a, const struct cb_addr *b);
 
 /* Take OBS's output apart: `server` is the service's server URL, `key` its stream key (NULL or ""
@@ -105,6 +108,25 @@ void cb_decide(const struct cb_url *u, bool parsed, const struct cb_local *local
 
 const char *cb_host_kind_text(enum cb_host_kind k);
 const char *cb_verdict_text(enum cb_verdict v);
+
+/* Which answer a log line reports. FINAL: the decision as made. PROVISIONAL: a host-name lookup
+ * overran its time box, so the host counts as another machine FOR NOW (the shadow starts). LATE: that
+ * lookup's answer arrived after all - when it says this PC, the shadow is stopped. */
+enum cb_phase {
+	CB_PHASE_FINAL,
+	CB_PHASE_PROVISIONAL,
+	CB_PHASE_LATE,
+};
+
+/* The one log line for a decision. Names the host, the port, and the path only as "path <the
+ * shadow's own path>", "other path" or "path unknown" - NEVER the stream key, OBS's path, the URL or
+ * its credentials. Returns the length it wanted (snprintf-style); the text is truncated to fit. */
+size_t cb_format_decision(enum cb_phase phase, const struct cb_url *u, bool parsed, const struct cb_url *relay,
+			  const struct cb_decision *d, unsigned long timebox_ms, char *buf, size_t size);
+
+/* FNV-1a over the WHOLE string: the log dedupe compares this, so a line too long for any buffer
+ * still logs when it changes. */
+unsigned long long cb_hash64(const char *s);
 
 #ifdef __cplusplus
 }

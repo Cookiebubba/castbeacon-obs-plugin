@@ -1,9 +1,10 @@
 /*
  * Cast Beacon OBS Plugin (GPLv2).
  *
- * This machine's facts for the stand-aside decision (stand-aside.h): its interface addresses, its
- * hostname, and - only when the decision asks - what a name resolves to, inside a time box.
- * Results are bmalloc()ed; the caller bfree()s them.
+ * This machine's facts for the stand-aside decision (stand-aside.h) - its interface addresses, its
+ * hostname, a host-name lookup that runs on its own thread - and cb_judge(), which runs the whole
+ * decision. No libobs in here (cb-thread.h underneath), so the unit tests build it too.
+ * Everything that returns memory returns malloc()ed memory; free it with free().
  */
 
 #pragma once
@@ -21,12 +22,30 @@ size_t cb_local_addresses(struct cb_addr **out);
 /* This machine's hostname. False when it cannot be read. */
 bool cb_local_hostname(char *buf, size_t size);
 
-/* Resolve `host` on a worker thread and wait at most timeout_ms for it. CB_RESOLVE_FAILED when the
- * name does not resolve, the time box runs out, or an earlier lookup is still stuck. */
-enum cb_resolve cb_resolve_name(const char *host, unsigned timeout_ms, struct cb_addr **out, size_t *n_out);
+/* How a host name is resolved. The default is the system's getaddrinfo; tests swap in a fake
+ * (a delay, a failure). Must set *out (malloc()ed) and *n when it returns CB_RESOLVE_OK. */
+typedef enum cb_resolve (*cb_resolver_fn)(const char *host, struct cb_addr **out, size_t *n);
+void cb_set_resolver(cb_resolver_fn fn); /* NULL = the system resolver */
+enum cb_resolve cb_system_resolve(const char *host, struct cb_addr **out, size_t *n);
 
-/* Wait for a lookup still in flight, so its thread never outlives the module. Call on unload. */
-void cb_resolver_shutdown(void);
+/* A lookup running on its own thread. */
+struct cb_lookup;
+struct cb_lookup *cb_lookup_start(const char *host); /* NULL when it could not start */
+/* True once the answer is in; false when timeout_ms ran out first (the lookup keeps going). */
+bool cb_lookup_wait(struct cb_lookup *l, unsigned long timeout_ms);
+/* Wait for the answer however long it takes, join the thread, free the lookup, return the answer. */
+enum cb_resolve cb_lookup_finish(struct cb_lookup *l, struct cb_addr **out, size_t *n);
+
+/* Reports one answer: FINAL, or PROVISIONAL then LATE when a lookup overran timebox_ms. `line` is
+ * the log line (cb_format_decision) - it never holds the stream key. */
+typedef void (*cb_report_fn)(void *ctx, enum cb_phase phase, bool stand_aside, const char *line);
+
+/* The whole decision for OBS's output (server + key) against the shadow's target (relay_server +
+ * relay_key). BLOCKS - possibly for as long as the system resolver takes - so it belongs on a
+ * worker thread. Local addresses are gathered only when the host is an IP literal, or after a
+ * lookup; the hostname only for a name. */
+void cb_judge(const char *server, const char *key, const char *relay_server, const char *relay_key,
+	      unsigned long timebox_ms, cb_report_fn report, void *ctx);
 
 #ifdef __cplusplus
 }

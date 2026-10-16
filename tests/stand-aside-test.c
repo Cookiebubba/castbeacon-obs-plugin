@@ -301,6 +301,153 @@ static void test_ip_parser(void)
 	CHECK(!cb_addr_is_loopback(&x), ":: is not loopback");
 }
 
+static void test_unspecified(void)
+{
+	/* 0.0.0.0 and :: as a destination reach this machine: treated as this PC */
+	EXPECT("rtmp://0.0.0.0:1935", "service", CB_STAND_ASIDE, CB_HOST_UNSPECIFIED);
+	EXPECT("rtmp://0.0.0.0", "other", CB_STAND_ASIDE, CB_HOST_UNSPECIFIED);
+	EXPECT("rtmp://[::]:1935", "service", CB_STAND_ASIDE, CB_HOST_UNSPECIFIED);
+	EXPECT("rtmp://[0:0:0:0:0:0:0:0]", "service", CB_STAND_ASIDE, CB_HOST_UNSPECIFIED);
+	EXPECT("rtmp://[::ffff:0.0.0.0]:1935", "service", CB_STAND_ASIDE, CB_HOST_UNSPECIFIED);
+	EXPECT("rtmp://0.0.0.0:1936", "service", CB_RUN_OTHER_PORT, CB_HOST_UNSPECIFIED);
+	struct cb_addr any4 = ip("0.0.0.0"), any6 = ip("::"), one = ip("0.0.0.1");
+	CHECK(cb_addr_is_unspecified(&any4) && cb_addr_is_unspecified(&any6), "0.0.0.0 and :: are unspecified");
+	CHECK(!cb_addr_is_unspecified(&one), "0.0.0.1 is not");
+	/* a name that resolves to the unspecified address is this PC too */
+	struct cb_decision d = decide_rs("rtmp://anywhere.lan:1935", "service", CB_RESOLVE_OK, &any4, 1);
+	CHECK(d.verdict == CB_STAND_ASIDE && d.host == CB_HOST_RESOLVES_LOCAL, "name -> 0.0.0.0: verdict %d host %d",
+	      d.verdict, d.host);
+}
+
+static void test_overlong_path(void)
+{
+	char key[701];
+	memset(key, 'k', 700);
+	key[700] = '\0';
+
+	/* a key too long for the path buffer leaves the path UNKNOWN - host and port still decide */
+	struct cb_url u;
+	CHECK(cb_url_parse("rtmp://127.0.0.1:1935", key, &u), "a 700-char key still parses");
+	CHECK(!u.path_known && u.path[0] == '\0', "the path is unknown, and empty");
+	CHECK(u.port == 1935 && strcmp(u.host, "127.0.0.1") == 0, "host and port survive");
+
+	struct cb_decision d = decide("rtmp://127.0.0.1:1935", key);
+	CHECK(d.verdict == CB_STAND_ASIDE && !d.path_matches, "this PC + long key: verdict %d", d.verdict);
+	d = decide("rtmp://192.168.1.20:1935", key);
+	CHECK(d.verdict == CB_STAND_ASIDE && d.host == CB_HOST_LOCAL_ADDR, "LAN + long key: verdict %d", d.verdict);
+	d = decide("rtmp://192.168.1.99:1935", key);
+	CHECK(d.verdict == CB_RUN_OTHER_HOST, "other machine + long key: verdict %d", d.verdict);
+	d = decide("rtmp://127.0.0.1:1936", key);
+	CHECK(d.verdict == CB_RUN_OTHER_PORT, "other port + long key: verdict %d", d.verdict);
+
+	/* the server path fits but the key overflows: the half-built path must not survive (it would
+	 * read "service" here and match the shadow's own path) */
+	CHECK(cb_url_parse("rtmp://127.0.0.1:1935/service", key, &u) && !u.path_known && u.path[0] == '\0',
+	      "half-built path cleared, got '%s'", u.path);
+	d = decide("rtmp://127.0.0.1:1935/service", key);
+	CHECK(!d.path_matches, "an unknown path never matches");
+
+	/* the same for a long path in the server URL itself */
+	char server[800];
+	snprintf(server, sizeof(server), "rtmp://127.0.0.1:1935/%s", key);
+	CHECK(cb_url_parse(server, "service", &u) && !u.path_known, "a long server path parses, path unknown");
+	d = decide(server, "service");
+	CHECK(d.verdict == CB_STAND_ASIDE && !d.path_matches, "long server path: verdict %d", d.verdict);
+
+	/* the boundary: CB_PATH_MAX - 1 characters fit (plus the NUL), CB_PATH_MAX do not */
+	char edge[CB_PATH_MAX + 1];
+	memset(edge, 'p', CB_PATH_MAX);
+	edge[CB_PATH_MAX] = '\0';
+	CHECK(cb_url_parse("rtmp://127.0.0.1:1935", edge, &u) && !u.path_known, "%d chars: unknown", CB_PATH_MAX);
+	edge[CB_PATH_MAX - 1] = '\0';
+	CHECK(cb_url_parse("rtmp://127.0.0.1:1935", edge, &u) && u.path_known && strlen(u.path) == CB_PATH_MAX - 1,
+	      "%d chars: known", CB_PATH_MAX - 1);
+}
+
+/* Format a decision's log line for server + key in one phase. */
+static void line_for(enum cb_phase phase, const char *server, const char *key, char *buf, size_t size)
+{
+	struct cb_url u, relay;
+	bool parsed = cb_url_parse(server, key, &u);
+	cb_url_parse("rtmp://127.0.0.1:1935", "service", &relay);
+	struct cb_decision d;
+	cb_decide(&u, parsed, &this_pc, CB_RESOLVE_FAILED, NULL, 0, RELAY_PORT, RELAY_PATH, &d);
+	cb_format_decision(phase, &u, parsed, &relay, &d, 3000, buf, size);
+}
+
+static void test_log_line(void)
+{
+	static const char *const servers[] = {
+		"rtmp://127.0.0.1:1935",
+		"rtmp://192.168.1.20:1935/SECRETPATH",
+		"rtmp://user:PASSWORD@192.168.1.20:1935/",
+		"rtmp://a.rtmp.youtube.com/live2/SECRETPATH",
+		"rtmps://live-api-s.facebook.com:443/rtmp/SECRETPATH",
+		"rtmp://studio-pc.lan:1935/SECRETPATH?token=SECRETQUERY",
+		"rtmp://[2001:db8::20]:1935",
+		"not a url SECRETPATH",
+		"rtmp://127.0.0.1:1936/SECRETPATH",
+	};
+	static const char *const keys[] = {"SECRETKEY-1234", "service?pass=SECRETQUERY", "", "live/SECRETKEY-1234"};
+	static const char *const secrets[] = {"SECRETKEY", "SECRETPATH", "SECRETQUERY", "PASSWORD", "user:"};
+	static const enum cb_phase phases[] = {CB_PHASE_FINAL, CB_PHASE_PROVISIONAL, CB_PHASE_LATE};
+
+	char buf[768];
+	for (size_t s = 0; s < sizeof(servers) / sizeof(servers[0]); s++)
+		for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++)
+			for (size_t p = 0; p < sizeof(phases) / sizeof(phases[0]); p++) {
+				line_for(phases[p], servers[s], keys[k], buf, sizeof(buf));
+				CHECK(strncmp(buf, "main output check: ", 19) == 0, "line starts right: %s", buf);
+				for (size_t x = 0; x < sizeof(secrets) / sizeof(secrets[0]); x++)
+					CHECK(strstr(buf, secrets[x]) == NULL, "'%s' leaked into: %s", secrets[x], buf);
+			}
+
+	/* what the line DOES say */
+	line_for(CB_PHASE_FINAL, "rtmp://192.168.1.20:1935", "service", buf, sizeof(buf));
+	CHECK(strstr(buf, "host 192.168.1.20") && strstr(buf, "port 1935 matches") && strstr(buf, "path service") &&
+		      strstr(buf, "standing aside"),
+	      "stand-aside line: %s", buf);
+	line_for(CB_PHASE_FINAL, "rtmp://192.168.1.20:1935", "SECRETKEY-1234", buf, sizeof(buf));
+	CHECK(strstr(buf, "other path") && strstr(buf, "standing aside"), "other-path line: %s", buf);
+	line_for(CB_PHASE_FINAL, "rtmp://127.0.0.1:1936", "service", buf, sizeof(buf));
+	CHECK(strstr(buf, "port 1936 differs") && strstr(buf, "proceeds"), "other-port line: %s", buf);
+	line_for(CB_PHASE_PROVISIONAL, "rtmp://studio-pc.lan:1935", "service", buf, sizeof(buf));
+	CHECK(strstr(buf, "still being looked up after 3000 ms") && strstr(buf, "for now"), "provisional line: %s",
+	      buf);
+	char key[701];
+	memset(key, 'k', 700);
+	key[700] = '\0';
+	line_for(CB_PHASE_FINAL, "rtmp://127.0.0.1:1935", key, buf, sizeof(buf));
+	CHECK(strstr(buf, "path unknown") && !strstr(buf, "kkkk"), "long-key line: %s", buf);
+	line_for(CB_PHASE_FINAL, "not a url", "service", buf, sizeof(buf));
+	CHECK(strstr(buf, "could not be read") != NULL, "unparseable line: %s", buf);
+
+	/* a small buffer truncates, never overruns */
+	char tiny[16];
+	memset(tiny, 'X', sizeof(tiny));
+	size_t want = 0;
+	{
+		struct cb_url u, relay;
+		cb_url_parse("rtmp://127.0.0.1:1935", "service", &u);
+		cb_url_parse("rtmp://127.0.0.1:1935", "service", &relay);
+		struct cb_decision d;
+		cb_decide(&u, true, &this_pc, CB_RESOLVE_NOT_TRIED, NULL, 0, RELAY_PORT, RELAY_PATH, &d);
+		want = cb_format_decision(CB_PHASE_FINAL, &u, true, &relay, &d, 0, tiny, sizeof(tiny));
+	}
+	CHECK(want > sizeof(tiny) && tiny[sizeof(tiny) - 1] == '\0', "truncated to fit, want %zu", want);
+}
+
+static void test_hash(void)
+{
+	char a[1200], b[1200];
+	memset(a, 'x', sizeof(a) - 1);
+	a[sizeof(a) - 1] = '\0';
+	memcpy(b, a, sizeof(a));
+	b[1100] = 'y'; /* differs only far past any 512-byte buffer */
+	CHECK(cb_hash64(a) != cb_hash64(b), "lines differing at char 1100 hash differently");
+	CHECK(cb_hash64(a) == cb_hash64(a), "the hash is stable");
+	CHECK(cb_hash64("") != cb_hash64("a"), "empty differs from one char");
+}
 int main(void)
 {
 	setup_machine();
@@ -314,6 +461,10 @@ int main(void)
 	test_other_machine();
 	test_unparseable();
 	test_ip_parser();
+	test_unspecified();
+	test_overlong_path();
+	test_log_line();
+	test_hash();
 
 	printf("stand-aside: %d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;

@@ -6,6 +6,7 @@
 
 #include "stand-aside.h"
 
+#include <stdio.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------- ASCII helpers (locale-free) */
@@ -215,6 +216,17 @@ bool cb_addr_is_loopback(const struct cb_addr *a)
 	return false;
 }
 
+bool cb_addr_is_unspecified(const struct cb_addr *a)
+{
+	if (!a || (a->family != 4 && a->family != 6))
+		return false;
+	for (int k = 0; k < (a->family == 4 ? 4 : 16); k++) {
+		if (a->b[k] != 0)
+			return false;
+	}
+	return true;
+}
+
 bool cb_addr_equal(const struct cb_addr *a, const struct cb_addr *b)
 {
 	if (!a || !b || a->family != b->family)
@@ -224,7 +236,8 @@ bool cb_addr_equal(const struct cb_addr *a, const struct cb_addr *b)
 
 static bool addr_is_local(const struct cb_addr *a, const struct cb_local *local)
 {
-	if (cb_addr_is_loopback(a))
+	/* 0.0.0.0 / :: as a DESTINATION reaches this machine (Linux, macOS; Windows refuses it) */
+	if (cb_addr_is_loopback(a) || cb_addr_is_unspecified(a))
 		return true;
 	if (!local || !local->addrs)
 		return false;
@@ -422,15 +435,17 @@ bool cb_url_parse(const char *server, const char *key, struct cb_url *out)
 		out->port = default_port(scheme, scheme_len);
 	}
 
-	/* the relay path: URL path + "/" + key, both without a query */
+	/* the relay path: URL path + "/" + key, both without a query. One too long to hold is UNKNOWN
+	 * (path_known false), never a parse failure: host and port still decide. */
 	size_t used = 0;
 	out->path[0] = '\0';
+	out->path_known = true;
 	const char *path = auth_end;
 	const char *path_end = path;
 	while (path_end < end && *path_end != '?' && *path_end != '#')
 		path_end++;
 	if (!append_segments(out->path, &used, path, (size_t)(path_end - path)))
-		return false;
+		out->path_known = false;
 	if (key && *key) {
 		size_t key_len = strcspn(key, "?#");
 		while (key_len && is_space(key[key_len - 1]))
@@ -440,9 +455,11 @@ bool cb_url_parse(const char *server, const char *key, struct cb_url *out)
 			k++;
 			key_len--;
 		}
-		if (!append_segments(out->path, &used, k, key_len))
-			return false;
+		if (out->path_known && !append_segments(out->path, &used, k, key_len))
+			out->path_known = false;
 	}
+	if (!out->path_known)
+		out->path[0] = '\0';
 	return true;
 }
 
@@ -471,11 +488,13 @@ void cb_decide(const struct cb_url *u, bool parsed, const struct cb_local *local
 		return;
 
 	out->port_matches = u->port != 0 && u->port == relay_port;
-	out->path_matches = relay_path != NULL && strcmp(u->path, relay_path) == 0;
+	out->path_matches = u->path_known && relay_path != NULL && strcmp(u->path, relay_path) == 0;
 
 	if (u->host_is_ip) {
 		if (cb_addr_is_loopback(&u->ip))
 			out->host = CB_HOST_LOOPBACK;
+		else if (cb_addr_is_unspecified(&u->ip))
+			out->host = CB_HOST_UNSPECIFIED;
 		else if (addr_is_local(&u->ip, local))
 			out->host = CB_HOST_LOCAL_ADDR;
 		else
@@ -518,6 +537,8 @@ const char *cb_host_kind_text(enum cb_host_kind k)
 		return "unreadable";
 	case CB_HOST_LOOPBACK:
 		return "this PC (loopback)";
+	case CB_HOST_UNSPECIFIED:
+		return "this PC (0.0.0.0 / :: reach this machine)";
 	case CB_HOST_LOCAL_ADDR:
 		return "this PC (one of its network addresses)";
 	case CB_HOST_HOSTNAME:
@@ -549,4 +570,82 @@ const char *cb_verdict_text(enum cb_verdict v)
 		return "host needs a lookup";
 	}
 	return "?";
+}
+
+/* ---------------------------------------------------------------- the log line */
+
+size_t cb_format_decision(enum cb_phase phase, const struct cb_url *u, bool parsed, const struct cb_url *relay,
+			  const struct cb_decision *d, unsigned long timebox_ms, char *buf, size_t size)
+{
+	if (!buf || size == 0)
+		return 0;
+	buf[0] = '\0';
+	if (!u || !relay || !d)
+		return 0;
+
+	int n;
+	if (!parsed || d->verdict == CB_RUN_UNPARSEABLE) {
+		n = snprintf(buf, size,
+			     "main output check: OBS's server URL could not be read - no clash assumed, "
+			     "shadow output proceeds");
+		return n < 0 ? 0 : (size_t)n;
+	}
+
+	const char *host_text = cb_host_kind_text(d->host);
+	const char *outcome;
+	switch (phase) {
+	case CB_PHASE_PROVISIONAL:
+		host_text = "still being looked up";
+		outcome = "no answer in time - treated as another machine for now, shadow output proceeds "
+			  "(and stops if the answer says this PC)";
+		break;
+	case CB_PHASE_LATE:
+		outcome = d->verdict == CB_STAND_ASIDE ? "late answer: this PC's relay - stopping the shadow output"
+						       : "late answer: not this PC - shadow output carries on";
+		break;
+	case CB_PHASE_FINAL:
+	default:
+		if (d->verdict == CB_STAND_ASIDE)
+			outcome = "OBS sends straight to this PC's relay - standing aside";
+		else if (d->verdict == CB_RUN_OTHER_PORT)
+			outcome = "not the relay's port - shadow output proceeds";
+		else
+			outcome = "another machine - shadow output proceeds";
+		break;
+	}
+
+	char port[48];
+	if (u->port)
+		snprintf(port, sizeof(port), "port %d %s", u->port, d->port_matches ? "matches" : "differs");
+	else
+		snprintf(port, sizeof(port), "port unknown");
+
+	/* "path <x>" only ever names the SHADOW's compiled-in path, never anything read from OBS */
+	char path[CB_PATH_MAX + 8];
+	if (!u->path_known)
+		snprintf(path, sizeof(path), "path unknown");
+	else if (d->path_matches)
+		snprintf(path, sizeof(path), "path %s", relay->path);
+	else
+		snprintf(path, sizeof(path), "other path");
+
+	char box[48] = "";
+	if (phase == CB_PHASE_PROVISIONAL)
+		snprintf(box, sizeof(box), " after %lu ms", timebox_ms);
+
+	n = snprintf(buf, size, "main output check: host %s: %s%s; %s (relay %d); %s - %s", u->host, host_text, box,
+		     port, relay->port, path, outcome);
+	return n < 0 ? 0 : (size_t)n;
+}
+
+unsigned long long cb_hash64(const char *s)
+{
+	unsigned long long h = 1469598103934665603ULL; /* FNV-1a */
+	if (!s)
+		return h;
+	for (; *s; s++) {
+		h ^= (unsigned char)*s;
+		h *= 1099511628211ULL;
+	}
+	return h;
 }

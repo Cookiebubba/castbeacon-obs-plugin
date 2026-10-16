@@ -28,17 +28,28 @@ by the Cast Beacon app.
   per path, so the two would knock each other off); on another path it would push OBS's
   program into `service` behind the operator's back, which can set off that stream's
   autostart or platform pushes. It stands aside when **both** hold:
-  1. the output's host is **this PC**: loopback (`127.0.0.1`, `::1`, `localhost`), any of
-     this PC's own network addresses (IPv4 or IPv6, e.g. `192.168.1.20`), or this PC's
-     hostname. Any other name is looked up once, for at most a second, and only when
-     point 2 already holds; a name that doesn't resolve counts as another machine;
+  1. the output's host is **this PC**: loopback (`127.0.0.1`, `::1`, `localhost`), the
+     unspecified address (`0.0.0.0`, `::`), any of this PC's own network addresses (IPv4 or
+     IPv6, e.g. `192.168.1.20`), or this PC's hostname. Any other name is looked up — only
+     when point 2 already holds; a name that doesn't resolve counts as another machine;
   2. the port is the relay's RTMP port (`1935`, or the scheme's default when none is
      given).
 
+  The check runs on a worker thread, never OBS's UI thread, and the shadow output is only
+  started once it has answered. A lookup gets 3 seconds: past that, the host counts as
+  another machine *for now* and the shadow starts — and if the answer, when it comes, says
+  this PC, the shadow is stopped.
+
   The path (server path + stream key, query ignored) is still compared, but only for the
-  log. Re-checked on every stream start; the decision is logged once per change
+  log; a path too long to hold is "unknown" and never changes the verdict. Re-checked on
+  every stream start; the decision is logged once per change
   (`[castbeacon] main output check: ...`), naming the host and port and saying
-  "path service" or "other path" — OBS's stream key is never logged.
+  "path service", "other path" or "path unknown" — OBS's stream key, path, URL and
+  credentials are never logged.
+
+  **Not covered:** WHIP. The check reads RTMP-family URLs (`rtmp`, `rtmps`, `rtmpt`, …);
+  OBS's WHIP output to this PC's relay (HTTP, a different port) is not recognised, so the
+  shadow output runs alongside it.
 
 OBS performs all encoding; this plugin only asks OBS to create and configure an encoder.
 
@@ -168,7 +179,10 @@ ctest --test-dir build_tests -C Release --output-on-failure
   knocked each other off in a reconnect loop). OBS pointed at this PC's relay on *any*
   path means "OBS sends straight to Cast Beacon", so the shadow stands aside and never
   publishes into `service` behind the operator's back; the path is compared for the log
-  only. Unit tests added (`tests/`).
+  only. `0.0.0.0` and `::` count as this PC. The check (and any host-name lookup) runs off
+  OBS's UI thread; a lookup slower than 3 s lets the shadow start, and stops it again if the
+  answer says this PC. A stuck lookup no longer holds up OBS's exit. Unit tests added
+  (`tests/`), including a harness for the lookup with a fake resolver.
 - **1.3.1** — Installs to `C:\ProgramData\obs-studio\plugins\castbeacon`, where OBS
   actually scans on Windows.
 - **1.3.0** — Module renamed `castpilot` → `castbeacon`; the old settings path is still

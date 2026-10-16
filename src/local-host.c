@@ -1,7 +1,8 @@
 /*
  * Cast Beacon OBS Plugin (GPLv2).
  *
- * This machine's facts for the stand-aside decision - see local-host.h.
+ * This machine's facts for the stand-aside decision, and the decision run end to end - see
+ * local-host.h.
  */
 
 #if !defined(_WIN32) && !defined(__APPLE__) && !defined(_GNU_SOURCE)
@@ -23,10 +24,9 @@
 #endif
 
 #include "local-host.h"
+#include "cb-thread.h"
 
-#include <util/bmem.h>
-#include <util/threading.h>
-
+#include <stdlib.h>
 #include <string.h>
 
 static bool from_sockaddr(const struct sockaddr *sa, struct cb_addr *out)
@@ -70,12 +70,14 @@ size_t cb_local_addresses(struct cb_addr **out)
 	ULONG rc = ERROR_BUFFER_OVERFLOW;
 
 	for (int attempt = 0; attempt < 3 && rc == ERROR_BUFFER_OVERFLOW; attempt++) {
-		bfree(list);
-		list = bmalloc(size);
+		free(list);
+		list = malloc(size);
+		if (!list)
+			return 0;
 		rc = GetAdaptersAddresses(AF_UNSPEC, flags, NULL, list, &size);
 	}
 	if (rc != NO_ERROR) {
-		bfree(list);
+		free(list);
 		return 0;
 	}
 
@@ -84,14 +86,16 @@ size_t cb_local_addresses(struct cb_addr **out)
 		for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u; u = u->Next)
 			count++;
 
-	struct cb_addr *addrs = count ? bzalloc(count * sizeof(*addrs)) : NULL;
+	struct cb_addr *addrs = count ? calloc(count, sizeof(*addrs)) : NULL;
 	size_t n = 0;
-	for (IP_ADAPTER_ADDRESSES *a = list; a; a = a->Next)
-		for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u && n < count; u = u->Next)
-			if (from_sockaddr(u->Address.lpSockaddr, &addrs[n]))
-				n++;
+	if (addrs) {
+		for (IP_ADAPTER_ADDRESSES *a = list; a; a = a->Next)
+			for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u && n < count; u = u->Next)
+				if (from_sockaddr(u->Address.lpSockaddr, &addrs[n]))
+					n++;
+	}
 
-	bfree(list);
+	free(list);
 	*out = addrs;
 	return n;
 }
@@ -122,11 +126,13 @@ size_t cb_local_addresses(struct cb_addr **out)
 		if (i->ifa_addr)
 			count++;
 
-	struct cb_addr *addrs = count ? bzalloc(count * sizeof(*addrs)) : NULL;
+	struct cb_addr *addrs = count ? calloc(count, sizeof(*addrs)) : NULL;
 	size_t n = 0;
-	for (struct ifaddrs *i = list; i && n < count; i = i->ifa_next)
-		if (i->ifa_addr && from_sockaddr(i->ifa_addr, &addrs[n]))
-			n++;
+	if (addrs) {
+		for (struct ifaddrs *i = list; i && n < count; i = i->ifa_next)
+			if (i->ifa_addr && from_sockaddr(i->ifa_addr, &addrs[n]))
+				n++;
+	}
 
 	freeifaddrs(list);
 	*out = addrs;
@@ -147,30 +153,12 @@ bool cb_local_hostname(char *buf, size_t size)
 
 #endif
 
-/* ---------------------------------------------------------------- time-boxed name lookup
- *
- * getaddrinfo has no timeout, so it runs on a worker thread and the caller (OBS's UI thread, in a
- * frontend event) waits at most timeout_ms. The job belongs to the CALLER side and is freed only
- * after its thread is joined, so a lookup that overruns simply stays "live" until it finishes.
- * Only ONE lookup is ever in flight: while a stuck one is still running, a new request is answered
- * "failed" at once instead of stacking threads, and unload joins the thread so it never runs code
- * from an unloaded module. Every entry point runs on OBS's UI thread, so the statics need no lock. */
+/* ---------------------------------------------------------------- the resolver */
 
-struct resolve_job {
-	char host[CB_HOST_MAX];
-	os_event_t *done;
-	enum cb_resolve result;
-	struct cb_addr *addrs;
-	size_t n;
-	pthread_t thread;
-};
-
-static struct resolve_job *live_job = NULL; /* a lookup whose thread has not been joined yet */
-
-static void *resolve_main(void *arg)
+enum cb_resolve cb_system_resolve(const char *host, struct cb_addr **out, size_t *n_out)
 {
-	struct resolve_job *job = arg;
-	os_set_thread_name("castbeacon: resolve");
+	*out = NULL;
+	*n_out = 0;
 
 #ifdef _WIN32
 	WSADATA wsa;
@@ -182,83 +170,211 @@ static void *resolve_main(void *arg)
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 
+	enum cb_resolve result = CB_RESOLVE_FAILED;
 	struct addrinfo *res = NULL;
-	job->result = CB_RESOLVE_FAILED;
-	if (getaddrinfo(job->host, NULL, &hints, &res) == 0 && res) {
+	if (getaddrinfo(host, NULL, &hints, &res) == 0 && res) {
 		size_t count = 0;
 		for (struct addrinfo *a = res; a; a = a->ai_next)
 			count++;
-		job->addrs = bzalloc(count * sizeof(*job->addrs));
-		for (struct addrinfo *a = res; a && job->n < count; a = a->ai_next)
-			if (from_sockaddr(a->ai_addr, &job->addrs[job->n]))
-				job->n++;
+		struct cb_addr *addrs = calloc(count, sizeof(*addrs));
+		size_t n = 0;
+		if (addrs) {
+			for (struct addrinfo *a = res; a && n < count; a = a->ai_next)
+				if (from_sockaddr(a->ai_addr, &addrs[n]))
+					n++;
+		}
 		freeaddrinfo(res);
-		if (job->n)
-			job->result = CB_RESOLVE_OK;
+		if (n) {
+			*out = addrs;
+			*n_out = n;
+			result = CB_RESOLVE_OK;
+		} else {
+			free(addrs);
+		}
 	}
 
 #ifdef _WIN32
 	if (wsa_ok)
 		WSACleanup();
 #endif
-
-	os_event_signal(job->done);
-	return NULL;
-}
-
-static void job_join_and_free(struct resolve_job *job)
-{
-	pthread_join(job->thread, NULL);
-	os_event_destroy(job->done);
-	bfree(job->addrs);
-	bfree(job);
-}
-
-enum cb_resolve cb_resolve_name(const char *host, unsigned timeout_ms, struct cb_addr **out, size_t *n_out)
-{
-	*out = NULL;
-	*n_out = 0;
-	if (!host || !*host || strlen(host) >= CB_HOST_MAX)
-		return CB_RESOLVE_FAILED;
-
-	if (live_job) {
-		if (os_event_try(live_job->done) != 0)
-			return CB_RESOLVE_FAILED; /* the last lookup is still stuck: do not stack another */
-		job_join_and_free(live_job);
-		live_job = NULL;
-	}
-
-	struct resolve_job *job = bzalloc(sizeof(*job));
-	memcpy(job->host, host, strlen(host) + 1);
-	if (os_event_init(&job->done, OS_EVENT_TYPE_MANUAL) != 0) {
-		bfree(job);
-		return CB_RESOLVE_FAILED;
-	}
-	if (pthread_create(&job->thread, NULL, resolve_main, job) != 0) {
-		os_event_destroy(job->done);
-		bfree(job);
-		return CB_RESOLVE_FAILED;
-	}
-
-	if (os_event_timedwait(job->done, timeout_ms) != 0) {
-		live_job = job; /* overran the time box: treated as unresolved, joined later */
-		return CB_RESOLVE_FAILED;
-	}
-
-	enum cb_resolve result = CB_RESOLVE_FAILED;
-	if (job->result == CB_RESOLVE_OK && job->n) {
-		*out = bmemdup(job->addrs, job->n * sizeof(*job->addrs));
-		*n_out = job->n;
-		result = CB_RESOLVE_OK;
-	}
-	job_join_and_free(job);
 	return result;
 }
 
-void cb_resolver_shutdown(void)
+static cb_resolver_fn resolver = cb_system_resolve;
+
+void cb_set_resolver(cb_resolver_fn fn)
 {
-	if (live_job) {
-		job_join_and_free(live_job);
-		live_job = NULL;
+	resolver = fn ? fn : cb_system_resolve;
+}
+
+/* ---------------------------------------------------------------- one lookup on its own thread
+ *
+ * The lookup belongs to whoever started it and is freed only after its thread is joined
+ * (cb_lookup_finish), so an answer that arrives late still has somewhere to land. */
+
+struct cb_lookup {
+	char host[CB_HOST_MAX];
+	cb_resolver_fn fn;
+	cb_event *done;
+	cb_thread *thread;
+	enum cb_resolve result;
+	struct cb_addr *addrs;
+	size_t n;
+};
+
+static void lookup_main(void *arg)
+{
+	struct cb_lookup *l = arg;
+	l->result = l->fn(l->host, &l->addrs, &l->n);
+	if (l->result == CB_RESOLVE_OK && (!l->addrs || !l->n))
+		l->result = CB_RESOLVE_FAILED;
+	cb_event_signal(l->done);
+}
+
+struct cb_lookup *cb_lookup_start(const char *host)
+{
+	if (!host || !*host || strlen(host) >= CB_HOST_MAX)
+		return NULL;
+	struct cb_lookup *l = calloc(1, sizeof(*l));
+	if (!l)
+		return NULL;
+	memcpy(l->host, host, strlen(host) + 1);
+	l->fn = resolver;
+	l->result = CB_RESOLVE_FAILED;
+	l->done = cb_event_create();
+	if (!l->done) {
+		free(l);
+		return NULL;
 	}
+	l->thread = cb_thread_start(lookup_main, l);
+	if (!l->thread) {
+		cb_event_destroy(l->done);
+		free(l);
+		return NULL;
+	}
+	return l;
+}
+
+bool cb_lookup_wait(struct cb_lookup *l, unsigned long timeout_ms)
+{
+	return l && cb_event_wait(l->done, timeout_ms);
+}
+
+enum cb_resolve cb_lookup_finish(struct cb_lookup *l, struct cb_addr **out, size_t *n)
+{
+	*out = NULL;
+	*n = 0;
+	if (!l)
+		return CB_RESOLVE_FAILED;
+	cb_thread_join(l->thread); /* returns once lookup_main has, however long that takes */
+	enum cb_resolve result = l->result;
+	if (result == CB_RESOLVE_OK) {
+		*out = l->addrs;
+		*n = l->n;
+	} else {
+		free(l->addrs);
+	}
+	cb_event_destroy(l->done);
+	free(l);
+	return result;
+}
+
+/* ---------------------------------------------------------------- the decision, end to end */
+
+struct judging {
+	struct cb_url u;
+	bool parsed;
+	struct cb_url relay;
+	struct cb_local local;
+	struct cb_addr *addrs; /* gathered lazily */
+	char hostname[256];
+	unsigned long timebox_ms;
+	cb_report_fn report;
+	void *ctx;
+};
+
+static void emit(struct judging *j, enum cb_phase phase, const struct cb_decision *d)
+{
+	char line[768];
+	cb_format_decision(phase, &j->u, j->parsed, &j->relay, d, j->timebox_ms, line, sizeof(line));
+	if (j->report)
+		j->report(j->ctx, phase, d->verdict == CB_STAND_ASIDE, line);
+}
+
+/* Decide; when the answer is "another machine" and this machine's addresses have not been read
+ * yet, read them and decide again. Loopback and 0.0.0.0/:: never need them. */
+static void decide(struct judging *j, enum cb_resolve rs, const struct cb_addr *resolved, size_t n_resolved,
+		   struct cb_decision *d)
+{
+	cb_decide(&j->u, j->parsed, &j->local, rs, resolved, n_resolved, j->relay.port, j->relay.path, d);
+	bool literal_elsewhere = j->u.host_is_ip && d->host == CB_HOST_OTHER;
+	bool resolved_elsewhere = rs == CB_RESOLVE_OK && d->host == CB_HOST_OTHER;
+	if ((literal_elsewhere || resolved_elsewhere) && !j->addrs) {
+		j->local.n_addrs = cb_local_addresses(&j->addrs);
+		j->local.addrs = j->addrs;
+		if (j->addrs)
+			cb_decide(&j->u, j->parsed, &j->local, rs, resolved, n_resolved, j->relay.port, j->relay.path,
+				  d);
+	}
+}
+
+/* The host is a name only DNS can place: look it up, waiting at most the time box for a FINAL
+ * answer; past it, report PROVISIONAL (another machine for now) and then the LATE answer. */
+static void judge_by_lookup(struct judging *j, struct cb_decision *d)
+{
+	struct cb_lookup *l = cb_lookup_start(j->u.host);
+	if (!l) {
+		decide(j, CB_RESOLVE_FAILED, NULL, 0, d);
+		emit(j, CB_PHASE_FINAL, d);
+		return;
+	}
+
+	bool in_time = cb_lookup_wait(l, j->timebox_ms);
+	if (!in_time) {
+		decide(j, CB_RESOLVE_FAILED, NULL, 0, d);
+		emit(j, CB_PHASE_PROVISIONAL, d);
+	}
+
+	struct cb_addr *resolved = NULL;
+	size_t n_resolved = 0;
+	enum cb_resolve rs = cb_lookup_finish(l, &resolved, &n_resolved);
+	decide(j, rs, resolved, n_resolved, d);
+	emit(j, in_time ? CB_PHASE_FINAL : CB_PHASE_LATE, d);
+	free(resolved);
+}
+
+void cb_judge(const char *server, const char *key, const char *relay_server, const char *relay_key,
+	      unsigned long timebox_ms, cb_report_fn report, void *ctx)
+{
+	struct judging *j = calloc(1, sizeof(*j));
+	if (!j) {
+		if (report)
+			report(ctx, CB_PHASE_FINAL, false, "main output check: out of memory - shadow output proceeds");
+		return;
+	}
+	j->timebox_ms = timebox_ms;
+	j->report = report;
+	j->ctx = ctx;
+
+	if (!cb_url_parse(relay_server, relay_key, &j->relay)) {
+		if (report)
+			report(ctx, CB_PHASE_FINAL, false,
+			       "main output check: the shadow's own target did not parse - shadow output proceeds");
+		free(j);
+		return;
+	}
+
+	j->parsed = cb_url_parse(server, key, &j->u);
+	if (j->parsed && !j->u.host_is_ip && cb_local_hostname(j->hostname, sizeof(j->hostname)))
+		j->local.hostname = j->hostname;
+
+	struct cb_decision d;
+	decide(j, CB_RESOLVE_NOT_TRIED, NULL, 0, &d);
+	if (d.verdict == CB_NEED_RESOLVE)
+		judge_by_lookup(j, &d);
+	else
+		emit(j, CB_PHASE_FINAL, &d);
+
+	free(j->addrs);
+	free(j);
 }
