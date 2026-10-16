@@ -18,6 +18,12 @@ jobs:
     permissions:
       contents: read
 
+  unit-tests:
+    name: Unit Tests 🧪
+    uses: ./.github/workflows/unit-tests.yaml
+    permissions:
+      contents: read
+
   build-project:
     name: Build Project 🧱
     uses: ./.github/workflows/build-project.yaml
@@ -29,7 +35,7 @@ jobs:
     name: Create Release 🛫
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
-    needs: build-project
+    needs: [build-project, unit-tests]
     defaults:
       run:
         shell: bash

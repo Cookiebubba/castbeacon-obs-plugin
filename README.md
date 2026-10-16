@@ -21,10 +21,23 @@ by the Cast Beacon app.
   session limit) it falls back to sharing the broadcast encoder.
 - **Optional independent bitrate / resolution / framerate**, read from the app's
   settings file at every stream start.
-- **It stands down when it isn't needed.** If OBS's *main* stream output is already
-  pointed at the local relay (the app fanning out to the platforms itself), a shadow
-  output would fight the main output for the same relay path — so the plugin doesn't
-  start one. Re-checked on every stream start.
+- **It stands aside when it isn't needed.** If OBS's *main* stream output already
+  publishes to the relay path the plugin would use (the app fanning out to the platforms
+  itself), a shadow output would fight the main output for that path — the relay allows
+  one publisher per path — so the plugin doesn't start one. It stands aside only when
+  **all three** hold:
+  1. the output's host is **this PC**: loopback (`127.0.0.1`, `::1`, `localhost`), any of
+     this PC's own network addresses (IPv4 or IPv6, e.g. `192.168.1.20`), or this PC's
+     hostname. Any other name is looked up once, for at most a second, and only when
+     points 2 and 3 already match; a name that doesn't resolve counts as another machine;
+  2. the port is the relay's RTMP port (`1935`, or the scheme's default when none is
+     given);
+  3. the path (server path + stream key, query ignored) is the plugin's own (`service`).
+
+  OBS sending to this PC's relay on a *different* path is no clash, so the shadow output
+  runs. Re-checked on every stream start; the decision is logged once per change
+  (`[castbeacon] main output check: ...`), naming the host and port and saying only
+  "key matches" or "key differs" — the stream key itself is never logged.
 
 OBS performs all encoding; this plugin only asks OBS to create and configure an encoder.
 
@@ -79,7 +92,7 @@ C:\ProgramData\obs-studio\plugins\castbeacon\bin\64bit\castbeacon.dll
 C:\ProgramData\obs-studio\plugins\castbeacon\data\
 ```
 
-Confirm it worked: OBS's log should contain `[castbeacon] loaded (v1.3.1)`. If the log
+Confirm it worked: OBS's log should contain `[castbeacon] loaded (v1.3.2)`. If the log
 mentions `castbeacon` nowhere at all, the files are somewhere OBS does not scan.
 
 **Do not delete `%APPDATA%\obs-studio\plugin_config\castpilot\settings.json`.** That is
@@ -133,6 +146,31 @@ its [wiki](https://github.com/obsproject/obs-plugintemplate/wiki) covers the bui
 Releases are cut by pushing a **bare** semantic-version tag (`1.3.0` — no `v` prefix) to
 `main`. CI builds all platforms, packages the Windows installer, and opens a draft
 release with the artifacts attached.
+
+### Unit tests
+
+`tests/` is a CMake project of its own — it needs neither libobs nor the plugin template,
+so it builds anywhere a C compiler does. CI runs it on Windows, macOS and Ubuntu, and a
+release is not drafted unless it passes.
+
+```
+cmake -S tests -B build_tests
+cmake --build build_tests --config Release
+ctest --test-dir build_tests -C Release --output-on-failure
+```
+
+## Changelog
+
+- **1.3.2** — The stand-aside check recognises this PC by any of its own addresses and by
+  its hostname, not only by `127.0.0.1` / `localhost` / `::1`: OBS pointed at the relay by
+  the PC's LAN address no longer gets a second publisher on the same path (the two
+  knocked each other off in a reconnect loop). The check now also compares the path and
+  stream key, so OBS sending to a *different* relay path no longer silences the shadow
+  output. Unit tests added (`tests/`).
+- **1.3.1** — Installs to `C:\ProgramData\obs-studio\plugins\castbeacon`, where OBS
+  actually scans on Windows.
+- **1.3.0** — Module renamed `castpilot` → `castbeacon`; the old settings path is still
+  read as a fallback.
 
 ## License
 

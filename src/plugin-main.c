@@ -18,14 +18,19 @@
  * picks the app's service in OBS and the app fans out to the platforms). In that setup the shadow
  * output would publish to the SAME relay path as the main output, and the relay only allows one
  * publisher per path — the two outputs then kick each other loose every couple of seconds. So on
- * every stream start we look at OBS's own stream service: if it already points at our local
- * ingest, the shadow output stands down. Everything else behaves exactly as before.
+ * every stream start we look at OBS's own stream service: if it publishes to THIS machine (by
+ * loopback, any of its own addresses or its hostname), on the relay's RTMP port, to the very
+ * path the shadow uses, the shadow output stands aside (stand-aside.c holds that decision).
+ * Everything else behaves exactly as before.
  */
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <plugin-support.h>
 #include <util/dstr.h>
+
+#include "stand-aside.h"
+#include "local-host.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -35,7 +40,11 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 static const char *SHADOW_SERVER = "rtmp://127.0.0.1:1935";
 static const char *SHADOW_KEY = "service";
-#define SHADOW_PORT 1935 /* the relay's RTMP ingest port (also RTMP's default port) */
+
+/* How long a stream start may wait on DNS, at most, to learn whether a name is this machine. It is
+ * spent only when the name is neither loopback nor this machine's hostname AND the output's port
+ * and path already match the shadow's - i.e. only when the answer decides a clash. */
+#define RESOLVE_TIMEOUT_MS 1000
 
 static obs_output_t *shadow_output = NULL;
 static obs_service_t *shadow_service = NULL;
@@ -136,70 +145,140 @@ static void load_local_cfg(int *keyint, int *bitrate_kbps, int *width, int *heig
 	obs_data_release(d);
 }
 
-/* Does this RTMP URL address our own local ingest? Compared structurally (host + port only) so
- * rtmp:// vs rtmps://, an app path or trailing slashes, a user:pass@ prefix and an omitted
- * (default) port all still match. */
-static bool url_is_local_ingest(const char *url)
+/* The decision line last logged: the stand-aside decision is logged once per CHANGE, not on every
+ * stream start. It names what was compared - host, port, and whether the key matches - and never
+ * the stream key, the path (which holds the key) or the URL (which may hold it too). */
+static char last_decision[512];
+
+static void log_decision_once(const char *line)
 {
-	if (!url || !*url)
-		return false;
-
-	const char *sep = strstr(url, "://");
-	const char *p = sep ? sep + 3 : url;
-
-	char auth[256];
-	size_t n = strcspn(p, "/?"); /* the authority ends at the path or query */
-	if (n == 0 || n >= sizeof(auth))
-		return false;
-	memcpy(auth, p, n);
-	auth[n] = '\0';
-
-	char *host = auth;
-	char *at = strrchr(auth, '@'); /* drop any credentials */
-	if (at)
-		host = at + 1;
-
-	const char *port = NULL;
-	if (*host == '[') { /* bracketed IPv6 literal: [::1]:1935 */
-		char *end = strchr(host, ']');
-		if (!end)
-			return false;
-		*end = '\0';
-		host++;
-		if (end[1] == ':')
-			port = end + 2;
-	} else {
-		char *colon = strchr(host, ':');
-		if (colon) {
-			*colon = '\0';
-			port = colon + 1;
-		}
-	}
-
-	if ((port && *port ? atoi(port) : SHADOW_PORT) != SHADOW_PORT)
-		return false;
-
-	return astrcmpi(host, "127.0.0.1") == 0 || astrcmpi(host, "localhost") == 0 || astrcmpi(host, "::1") == 0;
+	if (strcmp(line, last_decision) == 0)
+		return;
+	obs_log(LOG_INFO, "%s", line);
+	snprintf(last_decision, sizeof(last_decision), "%s", line);
 }
 
-/* True when OBS's own stream output already publishes to our relay, i.e. the app is downstream of
- * the broadcast and a shadow output would just fight it for the path. Re-read on every stream
- * start, since the operator can switch services between streams. */
+static bool host_is_this_pc(enum cb_host_kind k)
+{
+	return k == CB_HOST_LOOPBACK || k == CB_HOST_LOCAL_ADDR || k == CB_HOST_HOSTNAME || k == CB_HOST_RESOLVES_LOCAL;
+}
+
+static void log_decision(const struct cb_url *u, const struct cb_url *relay, const struct cb_decision *d)
+{
+	struct dstr line = {0};
+
+	if (d->verdict == CB_RUN_UNPARSEABLE) {
+		dstr_copy(&line, "main output check: OBS's server URL could not be read - no clash assumed, "
+				 "shadow output proceeds");
+	} else {
+		const char *outcome;
+		if (d->verdict == CB_STAND_ASIDE)
+			outcome = "OBS's main output already publishes the shadow's path - standing aside";
+		else if (d->verdict == CB_RUN_OTHER_PATH && host_is_this_pc(d->host))
+			outcome = "OBS sends to this PC's relay but a different path - no clash, shadow output "
+				  "proceeds alongside it";
+		else if (d->verdict == CB_RUN_OTHER_PATH)
+			outcome = "different path - no clash, shadow output proceeds";
+		else if (d->verdict == CB_RUN_OTHER_PORT)
+			outcome = "not the relay's port - no clash, shadow output proceeds";
+		else
+			outcome = "another machine - no clash, shadow output proceeds";
+
+		struct dstr port = {0};
+		if (u->port)
+			dstr_printf(&port, "port %d %s", u->port, d->port_matches ? "matches" : "differs");
+		else
+			dstr_copy(&port, "port unknown");
+
+		dstr_printf(&line, "main output check: host %s: %s; %s (relay %d); key %s - %s", u->host,
+			    cb_host_kind_text(d->host), port.array, relay->port,
+			    d->path_matches ? "matches" : "differs", outcome);
+		dstr_free(&port);
+	}
+
+	log_decision_once(line.array);
+	dstr_free(&line);
+}
+
+/* The shadow's own target, taken apart by the same parser as OBS's output so the two compare like
+ * for like: port 1935, path "service". */
+static bool shadow_target(struct cb_url *relay)
+{
+	static struct cb_url parsed;
+	static bool ok = false;
+	if (!ok)
+		ok = cb_url_parse(SHADOW_SERVER, SHADOW_KEY, &parsed);
+	if (ok)
+		*relay = parsed;
+	return ok;
+}
+
+/* The stand-aside decision for one server URL + key, with this machine's facts gathered here.
+ * DNS is consulted only when cb_decide says the answer hinges on it, and then inside the time
+ * box; a name that does not resolve in time counts as another machine. */
+static bool url_feeds_us(const char *server, const char *key)
+{
+	struct cb_url relay;
+	if (!shadow_target(&relay)) {
+		obs_log(LOG_WARNING, "main output check: the shadow's own target did not parse - "
+				     "shadow output proceeds");
+		return false;
+	}
+
+	struct cb_url u;
+	bool parsed = cb_url_parse(server, key, &u);
+
+	struct cb_addr *addrs = NULL;
+	size_t n_addrs = 0;
+	char hostname[256] = "";
+	if (parsed) {
+		n_addrs = cb_local_addresses(&addrs);
+		cb_local_hostname(hostname, sizeof(hostname));
+	}
+	struct cb_local local = {addrs, n_addrs, hostname};
+
+	struct cb_decision d;
+	cb_decide(&u, parsed, &local, CB_RESOLVE_NOT_TRIED, NULL, 0, relay.port, relay.path, &d);
+	if (d.verdict == CB_NEED_RESOLVE) {
+		struct cb_addr *resolved = NULL;
+		size_t n_resolved = 0;
+		enum cb_resolve rs = cb_resolve_name(u.host, RESOLVE_TIMEOUT_MS, &resolved, &n_resolved);
+		cb_decide(&u, parsed, &local, rs, resolved, n_resolved, relay.port, relay.path, &d);
+		bfree(resolved);
+	}
+	bfree(addrs);
+
+	log_decision(&u, &relay, &d);
+	return d.verdict == CB_STAND_ASIDE;
+}
+
+/* True when OBS's own stream output already publishes to the shadow's relay path, i.e. the app is
+ * downstream of the broadcast and a shadow output would just fight it for the path. Re-read on
+ * every stream start, since the operator can switch services between streams. */
 static bool main_output_feeds_us(void)
 {
 	obs_service_t *svc = obs_frontend_get_streaming_service(); /* borrowed ref - do not release */
-	if (!svc)
+	if (!svc) {
+		log_decision_once("main output check: OBS has no stream service to read - shadow output proceeds");
 		return false;
+	}
 
 	const char *url = obs_service_get_connect_info(svc, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
-	if (url && *url)
-		return url_is_local_ingest(url);
+	const char *key = obs_service_get_connect_info(svc, OBS_SERVICE_CONNECT_INFO_STREAM_KEY);
 
-	/* Service types that don't implement get_connect_info: read the raw setting instead. */
-	obs_data_t *settings = obs_service_get_settings(svc);
-	if (!settings)
-		return false;
-	bool hit = url_is_local_ingest(obs_data_get_string(settings, "server"));
+	/* Service types that don't implement get_connect_info: read the raw settings instead. */
+	obs_data_t *settings = NULL;
+	if (!url || !*url || !key) {
+		settings = obs_service_get_settings(svc);
+		if (settings) {
+			if (!url || !*url)
+				url = obs_data_get_string(settings, "server");
+			if (!key)
+				key = obs_data_get_string(settings, "key");
+		}
+	}
+
+	bool hit = url_feeds_us(url, key);
 	obs_data_release(settings);
 	return hit;
 }
@@ -376,5 +455,6 @@ void obs_module_unload(void)
 {
 	stop_shadow();
 	obs_frontend_remove_event_callback(on_frontend_event, NULL);
+	cb_resolver_shutdown(); /* a DNS lookup still running must not outlive the module */
 	obs_log(LOG_INFO, "unloaded");
 }

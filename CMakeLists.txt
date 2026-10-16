@@ -34,6 +34,11 @@ if(ENABLE_QT)
   )
 endif()
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c)
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/stand-aside.c src/local-host.c)
+
+# local-host.c: GetAdaptersAddresses (iphlpapi) and getaddrinfo (ws2_32).
+if(WIN32)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE iphlpapi ws2_32)
+endif()
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
