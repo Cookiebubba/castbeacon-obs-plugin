@@ -34,7 +34,10 @@ if(ENABLE_QT)
   )
 endif()
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/stand-aside.c src/local-host.c src/cb-thread.c)
+target_sources(
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE src/plugin-main.c src/stand-aside.c src/local-host.c src/cb-thread.c src/shadow-control.c
+)
 
 # local-host.c: GetAdaptersAddresses (iphlpapi) and getaddrinfo (ws2_32); cb-thread.c: dladdr/dlopen.
 if(WIN32)

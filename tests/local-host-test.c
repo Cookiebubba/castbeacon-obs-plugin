@@ -34,10 +34,13 @@ static int checks = 0;
  *
  * The host name says how to answer:  [slow-]<what>.test
  *   here-*    127.0.0.1 (this PC)        any-*    0.0.0.0 (this PC)
+ *   mine-*    one of this machine's REAL interface addresses (found by test_this_machine)
  *   there-*   203.0.113.9 (elsewhere)    fail-*   no answer
  * "slow-" first adds SLOW_MS of delay. Every call is counted. */
 
 static volatile long resolver_calls = 0;
+static struct cb_addr my_address;
+static bool have_my_address = false;
 
 static enum cb_resolve fake_resolve(const char *host, struct cb_addr **out, size_t *n)
 {
@@ -47,6 +50,17 @@ static enum cb_resolve fake_resolve(const char *host, struct cb_addr **out, size
 	if (strncmp(host, "slow-", 5) == 0) {
 		cb_sleep_ms(SLOW_MS);
 		host += 5;
+	}
+	if (strncmp(host, "mine-", 5) == 0) {
+		if (!have_my_address)
+			return CB_RESOLVE_FAILED;
+		struct cb_addr *m = malloc(sizeof(*m));
+		if (!m)
+			return CB_RESOLVE_FAILED;
+		*m = my_address;
+		*out = m;
+		*n = 1;
+		return CB_RESOLVE_OK;
 	}
 	const char *ip = NULL;
 	if (strncmp(host, "here-", 5) == 0)
@@ -169,20 +183,26 @@ static void test_judge_with_lookup(void)
 
 static void test_judge_late_answer(void)
 {
-	/* L2: a slow name that turns out to be THIS PC. Provisionally another machine (the shadow may
-	 * start), then the late answer says stand aside - the plugin stops the shadow on it. */
+	/* A slow name: PROVISIONAL is always stand aside (it may be this PC - a stray publish into the
+	 * shadow's path could release that stream's pushes). The LATE answer decides. */
 	struct record r = judge("rtmp://slow-here-x.test:1935", "service", 100);
 	CHECK(r.n == 2, "two answers, got %d", r.n);
-	CHECK(r.a[0].phase == CB_PHASE_PROVISIONAL && !r.a[0].stand_aside, "first: provisional run (%s)", r.a[0].line);
+	CHECK(r.a[0].phase == CB_PHASE_PROVISIONAL && r.a[0].stand_aside, "first: provisional aside (%s)", r.a[0].line);
 	CHECK(r.a[1].phase == CB_PHASE_LATE && r.a[1].stand_aside, "then: late stand-aside (%s)", r.a[1].line);
 	CHECK(strstr(r.a[0].line, "still being looked up") != NULL, "provisional line says so: %s", r.a[0].line);
-	CHECK(strstr(r.a[1].line, "stopping the shadow") != NULL, "late line says so: %s", r.a[1].line);
+	CHECK(strstr(r.a[0].line, "standing aside for now") != NULL, "provisional line says so: %s", r.a[0].line);
+	CHECK(strstr(r.a[1].line, "staying aside") != NULL, "late line says so: %s", r.a[1].line);
 
-	/* a slow name that is elsewhere: provisional run, late "carries on" */
+	/* a slow name that is elsewhere: provisional aside, then the late answer starts the shadow */
 	r = judge("rtmp://slow-there-x.test:1935", "service", 100);
-	CHECK(r.n == 2 && r.a[0].phase == CB_PHASE_PROVISIONAL && r.a[1].phase == CB_PHASE_LATE &&
-		      !r.a[0].stand_aside && !r.a[1].stand_aside,
+	CHECK(r.n == 2 && r.a[0].phase == CB_PHASE_PROVISIONAL && r.a[1].phase == CB_PHASE_LATE && r.a[0].stand_aside &&
+		      !r.a[1].stand_aside,
 	      "slow elsewhere: %d answers", r.n);
+	CHECK(strstr(r.a[1].line, "starting the shadow output") != NULL, "late line says so: %s", r.a[1].line);
+
+	/* a slow name that fails: provisional aside, late answer "unresolved" = another machine */
+	r = judge("rtmp://slow-fail-x.test:1935", "service", 100);
+	CHECK(r.n == 2 && r.a[0].stand_aside && !r.a[1].stand_aside, "slow failure: %d answers", r.n);
 
 	/* the same slow name inside a generous time box is one FINAL answer */
 	r = judge("rtmp://slow-here-x.test:1935", "service", 5000);
@@ -213,9 +233,22 @@ static void test_this_machine(void)
 			 (unsigned)addrs[i].b[2], (unsigned)addrs[i].b[3]);
 		EXPECT_FINAL(url, "service", true);
 		EXPECT_FINAL(url, "other", true);
+		my_address = addrs[i];
+		have_my_address = true;
 		break;
 	}
 	free(addrs);
+
+	/* a name that resolves to one of this machine's REAL addresses: the address list is read AFTER
+	 * the lookup (lazily) and the name is this PC */
+	if (have_my_address) {
+		EXPECT_FINAL("rtmp://mine-x.test:1935", "service", true);
+		EXPECT_FINAL("rtmp://slow-mine-x.test:1935", "service", true); /* in the 2 s box */
+		struct record r = judge("rtmp://slow-mine-x.test:1935", "service", 100);
+		CHECK(r.n == 2 && r.a[0].stand_aside && r.a[1].stand_aside, "slow mine: aside, then aside");
+	} else {
+		printf("no non-loopback IPv4 here - real-address lookup case skipped\n");
+	}
 
 	char host[256];
 	if (cb_local_hostname(host, sizeof(host))) {

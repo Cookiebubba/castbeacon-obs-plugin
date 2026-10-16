@@ -68,6 +68,36 @@ void cb_event_destroy(cb_event *e)
 	}
 }
 
+struct cb_mutex {
+	CRITICAL_SECTION cs;
+};
+
+cb_mutex *cb_mutex_create(void)
+{
+	cb_mutex *m = calloc(1, sizeof(*m));
+	if (m)
+		InitializeCriticalSection(&m->cs);
+	return m;
+}
+
+void cb_mutex_lock(cb_mutex *m)
+{
+	EnterCriticalSection(&m->cs);
+}
+
+void cb_mutex_unlock(cb_mutex *m)
+{
+	LeaveCriticalSection(&m->cs);
+}
+
+void cb_mutex_destroy(cb_mutex *m)
+{
+	if (m) {
+		DeleteCriticalSection(&m->cs);
+		free(m);
+	}
+}
+
 static DWORD WINAPI trampoline(LPVOID p)
 {
 	struct start_block s = *(struct start_block *)p;
@@ -118,6 +148,11 @@ void cb_sleep_ms(unsigned long ms)
 	Sleep((DWORD)ms);
 }
 
+unsigned long long cb_now_ms(void)
+{
+	return (unsigned long long)GetTickCount64();
+}
+
 bool cb_pin_module(void)
 {
 	HMODULE m = NULL;
@@ -151,7 +186,19 @@ cb_event *cb_event_create(void)
 		free(e);
 		return NULL;
 	}
-	if (pthread_cond_init(&e->c, NULL) != 0) {
+#ifdef __APPLE__
+	/* macOS has no pthread_condattr_setclock: cb_event_wait uses relative waits there instead */
+	int rc = pthread_cond_init(&e->c, NULL);
+#else
+	pthread_condattr_t attr;
+	int rc = pthread_condattr_init(&attr);
+	if (rc == 0) {
+		pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+		rc = pthread_cond_init(&e->c, &attr);
+		pthread_condattr_destroy(&attr);
+	}
+#endif
+	if (rc != 0) {
 		pthread_mutex_destroy(&e->m);
 		free(e);
 		return NULL;
@@ -179,7 +226,7 @@ bool cb_event_wait(cb_event *e, unsigned long timeout_ms)
 			pthread_cond_wait(&e->c, &e->m);
 	} else {
 		struct timespec until;
-		clock_gettime(CLOCK_REALTIME, &until);
+		clock_gettime(CLOCK_MONOTONIC, &until);
 		until.tv_sec += (time_t)(timeout_ms / 1000);
 		until.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
 		if (until.tv_nsec >= 1000000000L) {
@@ -187,8 +234,22 @@ bool cb_event_wait(cb_event *e, unsigned long timeout_ms)
 			until.tv_nsec -= 1000000000L;
 		}
 		while (!e->set) {
+#ifdef __APPLE__
+			struct timespec now, left;
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			left.tv_sec = until.tv_sec - now.tv_sec;
+			left.tv_nsec = until.tv_nsec - now.tv_nsec;
+			if (left.tv_nsec < 0) {
+				left.tv_sec--;
+				left.tv_nsec += 1000000000L;
+			}
+			if (left.tv_sec < 0)
+				break;
+			pthread_cond_timedwait_relative_np(&e->c, &e->m, &left);
+#else
 			if (pthread_cond_timedwait(&e->c, &e->m, &until) == ETIMEDOUT)
 				break;
+#endif
 		}
 	}
 	bool set = e->set;
@@ -203,6 +264,38 @@ void cb_event_destroy(cb_event *e)
 	pthread_cond_destroy(&e->c);
 	pthread_mutex_destroy(&e->m);
 	free(e);
+}
+
+struct cb_mutex {
+	pthread_mutex_t m;
+};
+
+cb_mutex *cb_mutex_create(void)
+{
+	cb_mutex *m = calloc(1, sizeof(*m));
+	if (m && pthread_mutex_init(&m->m, NULL) != 0) {
+		free(m);
+		return NULL;
+	}
+	return m;
+}
+
+void cb_mutex_lock(cb_mutex *m)
+{
+	pthread_mutex_lock(&m->m);
+}
+
+void cb_mutex_unlock(cb_mutex *m)
+{
+	pthread_mutex_unlock(&m->m);
+}
+
+void cb_mutex_destroy(cb_mutex *m)
+{
+	if (m) {
+		pthread_mutex_destroy(&m->m);
+		free(m);
+	}
 }
 
 static void *trampoline(void *p)
@@ -255,6 +348,13 @@ void cb_sleep_ms(unsigned long ms)
 	ts.tv_nsec = (long)(ms % 1000) * 1000000L;
 	while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
 	}
+}
+
+unsigned long long cb_now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (unsigned long long)ts.tv_sec * 1000ULL + (unsigned long long)(ts.tv_nsec / 1000000L);
 }
 
 bool cb_pin_module(void)

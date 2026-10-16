@@ -596,12 +596,12 @@ size_t cb_format_decision(enum cb_phase phase, const struct cb_url *u, bool pars
 	switch (phase) {
 	case CB_PHASE_PROVISIONAL:
 		host_text = "still being looked up";
-		outcome = "no answer in time - treated as another machine for now, shadow output proceeds "
-			  "(and stops if the answer says this PC)";
+		outcome = "no answer in time - standing aside for now (the shadow starts only if the answer "
+			  "says another machine)";
 		break;
 	case CB_PHASE_LATE:
-		outcome = d->verdict == CB_STAND_ASIDE ? "late answer: this PC's relay - stopping the shadow output"
-						       : "late answer: not this PC - shadow output carries on";
+		outcome = d->verdict == CB_STAND_ASIDE ? "late answer: this PC's relay - staying aside"
+						       : "late answer: another machine - starting the shadow output";
 		break;
 	case CB_PHASE_FINAL:
 	default:

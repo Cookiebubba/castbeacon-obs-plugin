@@ -36,9 +36,11 @@ by the Cast Beacon app.
      given).
 
   The check runs on a worker thread, never OBS's UI thread, and the shadow output is only
-  started once it has answered. A lookup gets 3 seconds: past that, the host counts as
-  another machine *for now* and the shadow starts — and if the answer, when it comes, says
-  this PC, the shadow is stopped.
+  started once it has answered. A lookup gets 3 seconds: past that, the plugin stands aside
+  *for now* (a name might be this PC, and a stray publish into `service` could set off that
+  stream's pushes) and starts the shadow only if the answer, when it comes, says another
+  machine. If no check can run at all, it stands aside and says so in the log. A stream that
+  starts again without stopping first has its old shadow stopped and is decided afresh.
 
   The path (server path + stream key, query ignored) is still compared, but only for the
   log; a path too long to hold is "unknown" and never changes the verdict. Re-checked on
@@ -180,9 +182,10 @@ ctest --test-dir build_tests -C Release --output-on-failure
   path means "OBS sends straight to Cast Beacon", so the shadow stands aside and never
   publishes into `service` behind the operator's back; the path is compared for the log
   only. `0.0.0.0` and `::` count as this PC. The check (and any host-name lookup) runs off
-  OBS's UI thread; a lookup slower than 3 s lets the shadow start, and stops it again if the
-  answer says this PC. A stuck lookup no longer holds up OBS's exit. Unit tests added
-  (`tests/`), including a harness for the lookup with a fake resolver.
+  OBS's UI thread; a lookup slower than 3 s stands aside until its answer, and the shadow
+  starts only if that says another machine. A stuck lookup no longer holds up OBS's exit.
+  Unit tests added (`tests/`): the decision, the lookup against a fake resolver, and the
+  start/stop state machine against a fake OBS.
 - **1.3.1** — Installs to `C:\ProgramData\obs-studio\plugins\castbeacon`, where OBS
   actually scans on Windows.
 - **1.3.0** — Module renamed `castpilot` → `castbeacon`; the old settings path is still

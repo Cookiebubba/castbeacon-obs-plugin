@@ -23,7 +23,7 @@
  * chosen "OBS sends straight to Cast Beacon" and the shadow output stands aside - on ANY path, so it
  * never publishes into "service" behind the operator's back (stand-aside.c holds that decision).
  * The decision runs on a worker thread (it may need a DNS lookup), and the shadow output is only
- * ever started from the UI thread once that decision is in (see "The main output check" below).
+ * ever started from the UI thread once that decision is in (shadow-control.c).
  * Everything else behaves exactly as before.
  */
 
@@ -32,12 +32,7 @@
 #include <plugin-support.h>
 #include <util/dstr.h>
 
-#include <util/platform.h>
-#include <util/threading.h>
-
-#include "stand-aside.h"
-#include "local-host.h"
-#include "cb-thread.h"
+#include "shadow-control.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -48,15 +43,14 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 static const char *SHADOW_SERVER = "rtmp://127.0.0.1:1935";
 static const char *SHADOW_KEY = "service";
 
-/* How long the decision waits on a host-name lookup before deciding "another machine, for now" and
- * letting the shadow start. A lookup is made only when the name is neither loopback nor this
- * machine's hostname AND the output's port is the relay's. It runs on a worker thread, never the UI. */
+/* How long the decision waits on a host-name lookup before answering "stand aside, for now" (the
+ * shadow starts only if the late answer says another machine). A lookup is made only when the name
+ * is neither loopback nor this machine's hostname AND the output's port is the relay's. It runs on a
+ * worker thread, never the UI. */
 #define DECISION_TIMEBOX_MS 3000
 
 /* How long unload waits for decisions still running before it pins the module and leaves them. */
 #define UNLOAD_WAIT_MS 2000
-
-#define MAX_DECIDERS 8
 
 static obs_output_t *shadow_output = NULL;
 static obs_service_t *shadow_service = NULL;
@@ -289,129 +283,37 @@ static void start_shadow_now(void)
 
 /* ------------------------------------------------------------------ The main output check
  *
- * On every stream start a DECIDER thread runs cb_judge() (local-host.c) on a copy of OBS's output
- * URL + key. Its answers come back to the UI thread through obs_queue_task(OBS_TASK_UI), and only
- * there is the shadow started or stopped:
- *   FINAL       - stand aside, or start the shadow;
- *   PROVISIONAL - a host-name lookup overran DECISION_TIMEBOX_MS: another machine for now, so the
- *                 shadow starts;
- *   LATE        - that lookup's answer: if it says this PC after all, the shadow is stopped.
- * Every answer carries the stream GENERATION it was asked for; one that arrives after the stream
- * stopped (or restarted) is logged and otherwise ignored. */
+ * The state machine lives in shadow-control.c (libobs-free, unit-tested). Here it gets OBS's side:
+ * start/stop the shadow, post to the UI thread, log. Its decider threads never touch libobs. */
 
-struct decider {
-	cb_thread *thread;
-	cb_event *done;
-	long generation;
-	char *server;
-	char *key;
-};
-
-struct verdict {
-	long generation;
-	enum cb_phase phase;
-	bool stand_aside;
-	char *line;
-};
-
-/* UI thread only. */
-static struct decider *deciders[MAX_DECIDERS];
-static long stream_generation = 0;
-static bool stream_live = false;
-
-/* Guards `shutting_down` against a decider posting to the UI while OBS is closing. */
-static pthread_mutex_t post_lock;
-static bool post_lock_ok = false;
-static bool shutting_down = false;
-
-/* The stand-aside decision is logged once per CHANGE. The dedupe compares a hash of the WHOLE line,
- * so a long line that changes past any buffer's end still logs. */
-static unsigned long long last_decision_hash = 0;
-static bool have_decision_hash = false;
-
-static void log_decision_once(const char *line)
+static void ctl_start_shadow(void *ctx)
 {
-	unsigned long long h = cb_hash64(line);
-	if (have_decision_hash && h == last_decision_hash)
-		return;
-	have_decision_hash = true;
-	last_decision_hash = h;
-	obs_log(LOG_INFO, "%s", line);
+	(void)ctx;
+	start_shadow_now();
 }
 
-static void apply_verdict(void *param) /* UI thread */
+static void ctl_stop_shadow(void *ctx)
 {
-	struct verdict *v = param;
-
-	if (!shutting_down) {
-		log_decision_once(v->line);
-		if (v->generation == stream_generation && stream_live) {
-			if (v->phase == CB_PHASE_LATE) {
-				if (v->stand_aside && shadow_output) {
-					obs_log(LOG_INFO,
-						"main output already feeds Cast Beacon - shadow output standing down");
-					stop_shadow();
-				}
-			} else if (v->stand_aside) {
-				obs_log(LOG_INFO,
-					"main output already feeds Cast Beacon - shadow output standing down");
-			} else {
-				start_shadow_now();
-			}
-		}
-	}
-
-	bfree(v->line);
-	bfree(v);
+	(void)ctx;
+	stop_shadow();
 }
 
-static void decider_report(void *ctx, enum cb_phase phase, bool stand_aside, const char *line) /* decider */
+static bool ctl_shadow_running(void *ctx)
 {
-	struct decider *dc = ctx;
-	struct verdict *v = bzalloc(sizeof(*v));
-	v->generation = dc->generation;
-	v->phase = phase;
-	v->stand_aside = stand_aside;
-	v->line = bstrdup(line);
-
-	pthread_mutex_lock(&post_lock);
-	bool post = !shutting_down;
-	if (post)
-		obs_queue_task(OBS_TASK_UI, apply_verdict, v, false);
-	pthread_mutex_unlock(&post_lock);
-
-	if (!post) {
-		bfree(v->line);
-		bfree(v);
-	}
+	(void)ctx;
+	return shadow_output != NULL;
 }
 
-static void decider_main(void *arg) /* decider thread */
+static void ctl_post_ui(void *ctx, void (*task)(void *arg), void *arg)
 {
-	struct decider *dc = arg;
-	cb_judge(dc->server, dc->key, SHADOW_SERVER, SHADOW_KEY, DECISION_TIMEBOX_MS, decider_report, dc);
-	cb_event_signal(dc->done);
+	(void)ctx;
+	obs_queue_task(OBS_TASK_UI, task, arg, false);
 }
 
-static void decider_free(struct decider *dc)
+static void ctl_log(void *ctx, enum cb_log_level level, const char *line)
 {
-	cb_event_destroy(dc->done);
-	bfree(dc->server);
-	bfree(dc->key);
-	bfree(dc);
-}
-
-/* Join and free every decider that has finished. UI thread. */
-static void reap_deciders(void)
-{
-	for (size_t i = 0; i < MAX_DECIDERS; i++) {
-		struct decider *dc = deciders[i];
-		if (dc && cb_event_wait(dc->done, 0)) {
-			cb_thread_join(dc->thread);
-			decider_free(dc);
-			deciders[i] = NULL;
-		}
-	}
+	(void)ctx;
+	obs_log(level == CB_LOG_WARNING ? LOG_WARNING : LOG_INFO, "%s", line);
 }
 
 /* OBS's own stream service as copies of its server URL and key (both bfree()d by the caller).
@@ -446,65 +348,22 @@ static bool read_main_output(char **server, char **key)
 /* STREAMING_STARTED. UI thread. */
 static void begin_shadow(void)
 {
-	reap_deciders();
-	if (shadow_output)
-		return; /* already running */
-
 	int keyint, bitrate, width, height, fps;
 	bool shadow_enabled;
 	load_local_cfg(&keyint, &bitrate, &width, &height, &fps, &shadow_enabled);
 	if (!shadow_enabled) {
+		cb_ctl_stream_stopped(); /* nothing from an earlier start may run on */
 		obs_log(LOG_INFO, "overflow feed disabled in settings - shadow output standing down");
 		return;
 	}
 
-	stream_generation++;
-	stream_live = true;
-
 	char *server = NULL, *key = NULL;
-	if (!read_main_output(&server, &key)) {
-		log_decision_once("main output check: OBS has no stream service to read - shadow output proceeds");
-		start_shadow_now();
-		return;
-	}
-
-	size_t slot = MAX_DECIDERS;
-	for (size_t i = 0; i < MAX_DECIDERS && slot == MAX_DECIDERS; i++)
-		if (!deciders[i])
-			slot = i;
-
-	struct decider *dc = NULL;
-	if (slot < MAX_DECIDERS) {
-		dc = bzalloc(sizeof(*dc));
-		dc->generation = stream_generation;
-		dc->server = server;
-		dc->key = key;
-		dc->done = cb_event_create();
-		if (dc->done)
-			dc->thread = cb_thread_start(decider_main, dc);
-	}
-	if (!dc || !dc->thread) {
-		/* Never start blind: with no decision, a shadow could land on the operator's own path. */
-		obs_log(LOG_WARNING, "main output check could not run - shadow output not started");
-		if (dc)
-			decider_free(dc);
-		else {
-			bfree(server);
-			bfree(key);
-		}
-		return;
-	}
-	deciders[slot] = dc;
-}
-
-/* STREAMING_STOPPING. UI thread. */
-static void end_shadow(void)
-{
-	stream_live = false;
-	stream_generation++; /* any answer still on its way is for a stream that has ended */
-	/* Stop BEFORE OBS frees the shared audio encoder (mandatory order). */
-	stop_shadow();
-	reap_deciders();
+	if (read_main_output(&server, &key))
+		cb_ctl_stream_started(server, key);
+	else
+		cb_ctl_stream_started(NULL, NULL);
+	bfree(server);
+	bfree(key);
 }
 
 static void on_frontend_event(enum obs_frontend_event event, void *data)
@@ -515,43 +374,16 @@ static void on_frontend_event(enum obs_frontend_event event, void *data)
 		begin_shadow();
 		break;
 	case OBS_FRONTEND_EVENT_STREAMING_STOPPING:
-		end_shadow();
+	case OBS_FRONTEND_EVENT_STREAMING_STOPPED:
+		/* STOPPING: stop BEFORE OBS frees the shared audio encoder (mandatory order).
+		 * STOPPED: the same again, harmlessly - a stream that failed may skip STOPPING. */
+		cb_ctl_stream_stopped();
 		break;
 	case OBS_FRONTEND_EVENT_EXIT:
-		/* From here on nothing is posted to the UI: it is going away. */
-		pthread_mutex_lock(&post_lock);
-		shutting_down = true;
-		pthread_mutex_unlock(&post_lock);
+		cb_ctl_exit(); /* from here on nothing is posted to the UI: it is going away */
 		break;
 	default:
 		break;
-	}
-}
-
-/* Unload: give running decisions UNLOAD_WAIT_MS in all to finish. One still stuck in the system
- * resolver (which can take 10-30 s) is left to finish on its own - after the module is PINNED, so
- * its thread never runs code from an unloaded module. Its memory is leaked deliberately. */
-static void wait_for_deciders(void)
-{
-	uint64_t deadline = os_gettime_ns() + (uint64_t)UNLOAD_WAIT_MS * 1000000ULL;
-	bool pinned = false;
-	for (size_t i = 0; i < MAX_DECIDERS; i++) {
-		struct decider *dc = deciders[i];
-		if (!dc)
-			continue;
-		uint64_t now = os_gettime_ns();
-		unsigned long left = now < deadline ? (unsigned long)((deadline - now) / 1000000ULL) : 0;
-		if (cb_event_wait(dc->done, left)) {
-			cb_thread_join(dc->thread);
-			decider_free(dc);
-		} else {
-			if (!pinned)
-				pinned = cb_pin_module();
-			obs_log(LOG_WARNING, "main output check still waiting on a lookup at exit - left to finish%s",
-				pinned ? " (module kept loaded)" : " (could not keep the module loaded)");
-			cb_thread_detach(dc->thread);
-		}
-		deciders[i] = NULL;
 	}
 }
 /* OBS shows these in its module listing / log. The plugin has no other user-facing text —
@@ -568,8 +400,17 @@ MODULE_EXPORT const char *obs_module_description(void)
 
 bool obs_module_load(void)
 {
-	post_lock_ok = pthread_mutex_init(&post_lock, NULL) == 0;
-	if (!post_lock_ok) {
+	struct cb_ctl_ops ops = {0};
+	ops.start_shadow = ctl_start_shadow;
+	ops.stop_shadow = ctl_stop_shadow;
+	ops.shadow_running = ctl_shadow_running;
+	ops.post_ui = ctl_post_ui;
+	ops.log = ctl_log;
+	ops.relay_server = SHADOW_SERVER;
+	ops.relay_key = SHADOW_KEY;
+	ops.timebox_ms = DECISION_TIMEBOX_MS;
+	ops.unload_wait_ms = UNLOAD_WAIT_MS;
+	if (!cb_ctl_init(&ops)) {
 		obs_log(LOG_WARNING, "could not create a lock - overflow feed unavailable");
 		return false;
 	}
@@ -580,14 +421,9 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
-	if (post_lock_ok) {
-		pthread_mutex_lock(&post_lock);
-		shutting_down = true;
-		pthread_mutex_unlock(&post_lock);
-	}
-
+	cb_ctl_exit();
 	stop_shadow();
 	obs_frontend_remove_event_callback(on_frontend_event, NULL);
-	wait_for_deciders(); /* never destroys post_lock: a detached decider may still take it */
+	cb_ctl_shutdown(); /* waits for deciders; pins the module if one is stuck */
 	obs_log(LOG_INFO, "unloaded");
 }

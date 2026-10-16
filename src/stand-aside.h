@@ -110,8 +110,9 @@ const char *cb_host_kind_text(enum cb_host_kind k);
 const char *cb_verdict_text(enum cb_verdict v);
 
 /* Which answer a log line reports. FINAL: the decision as made. PROVISIONAL: a host-name lookup
- * overran its time box, so the host counts as another machine FOR NOW (the shadow starts). LATE: that
- * lookup's answer arrived after all - when it says this PC, the shadow is stopped. */
+ * overran its time box, so the shadow stands aside FOR NOW - a name could be this PC, and a stray
+ * publish into the shadow's path could set off that stream's pushes. LATE: that lookup's answer after
+ * all - the shadow starts only if it says another machine. */
 enum cb_phase {
 	CB_PHASE_FINAL,
 	CB_PHASE_PROVISIONAL,

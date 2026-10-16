@@ -297,8 +297,10 @@ static void emit(struct judging *j, enum cb_phase phase, const struct cb_decisio
 {
 	char line[768];
 	cb_format_decision(phase, &j->u, j->parsed, &j->relay, d, j->timebox_ms, line, sizeof(line));
+	/* PROVISIONAL is always "stand aside": until the name is placed it may be this PC */
+	bool aside = phase == CB_PHASE_PROVISIONAL || d->verdict == CB_STAND_ASIDE;
 	if (j->report)
-		j->report(j->ctx, phase, d->verdict == CB_STAND_ASIDE, line);
+		j->report(j->ctx, phase, aside, line);
 }
 
 /* Decide; when the answer is "another machine" and this machine's addresses have not been read
@@ -319,7 +321,7 @@ static void decide(struct judging *j, enum cb_resolve rs, const struct cb_addr *
 }
 
 /* The host is a name only DNS can place: look it up, waiting at most the time box for a FINAL
- * answer; past it, report PROVISIONAL (another machine for now) and then the LATE answer. */
+ * answer; past it, report PROVISIONAL (stand aside for now) and then the LATE answer. */
 static void judge_by_lookup(struct judging *j, struct cb_decision *d)
 {
 	struct cb_lookup *l = cb_lookup_start(j->u.host);

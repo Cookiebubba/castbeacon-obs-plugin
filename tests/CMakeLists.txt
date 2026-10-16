@@ -27,6 +27,10 @@ function(castbeacon_test name)
       PRIVATE -Wall -Wextra -Werror -Wshadow -Wconversion -Wno-sign-conversion
     )
   endif()
+  # the macOS plugin build treats a missing final newline as an error: so do the tests
+  if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    target_compile_options(${name} PRIVATE -Wnewline-eof)
+  endif()
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
@@ -44,4 +48,18 @@ castbeacon_test(
 target_link_libraries(local-host-test PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 if(WIN32)
   target_link_libraries(local-host-test PRIVATE iphlpapi ws2_32)
+endif()
+
+# The shadow output's state machine, against a fake OBS (shadow, UI queue, judge, pin).
+castbeacon_test(
+  control-test
+  control-test.c
+  ../src/shadow-control.c
+  ../src/local-host.c
+  ../src/cb-thread.c
+  ../src/stand-aside.c
+)
+target_link_libraries(control-test PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+if(WIN32)
+  target_link_libraries(control-test PRIVATE iphlpapi ws2_32)
 endif()

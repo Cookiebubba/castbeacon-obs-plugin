@@ -36,9 +36,13 @@ bool cb_lookup_wait(struct cb_lookup *l, unsigned long timeout_ms);
 /* Wait for the answer however long it takes, join the thread, free the lookup, return the answer. */
 enum cb_resolve cb_lookup_finish(struct cb_lookup *l, struct cb_addr **out, size_t *n);
 
-/* Reports one answer: FINAL, or PROVISIONAL then LATE when a lookup overran timebox_ms. `line` is
- * the log line (cb_format_decision) - it never holds the stream key. */
+/* Reports one answer: FINAL, or PROVISIONAL (always stand_aside) then LATE when a lookup overran
+ * timebox_ms. `line` is the log line (cb_format_decision) - it never holds the stream key. */
 typedef void (*cb_report_fn)(void *ctx, enum cb_phase phase, bool stand_aside, const char *line);
+
+/* cb_judge's signature, so a caller can be handed a different judge (tests). */
+typedef void (*cb_judge_fn)(const char *server, const char *key, const char *relay_server, const char *relay_key,
+			    unsigned long timebox_ms, cb_report_fn report, void *ctx);
 
 /* The whole decision for OBS's output (server + key) against the shadow's target (relay_server +
  * relay_key). BLOCKS - possibly for as long as the system resolver takes - so it belongs on a
