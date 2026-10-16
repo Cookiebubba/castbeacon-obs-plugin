@@ -21,23 +21,24 @@ by the Cast Beacon app.
   session limit) it falls back to sharing the broadcast encoder.
 - **Optional independent bitrate / resolution / framerate**, read from the app's
   settings file at every stream start.
-- **It stands aside when it isn't needed.** If OBS's *main* stream output already
-  publishes to the relay path the plugin would use (the app fanning out to the platforms
-  itself), a shadow output would fight the main output for that path — the relay allows
-  one publisher per path — so the plugin doesn't start one. It stands aside only when
-  **all three** hold:
+- **It stands aside when OBS sends straight to Cast Beacon.** If OBS's *main* stream
+  output points at this PC's relay, the operator has chosen to feed Cast Beacon directly
+  (the app fanning out to the platforms itself), so the plugin starts no shadow output —
+  on **any** path. On the same path it would be a second publisher (the relay allows one
+  per path, so the two would knock each other off); on another path it would push OBS's
+  program into `service` behind the operator's back, which can set off that stream's
+  autostart or platform pushes. It stands aside when **both** hold:
   1. the output's host is **this PC**: loopback (`127.0.0.1`, `::1`, `localhost`), any of
      this PC's own network addresses (IPv4 or IPv6, e.g. `192.168.1.20`), or this PC's
      hostname. Any other name is looked up once, for at most a second, and only when
-     points 2 and 3 already match; a name that doesn't resolve counts as another machine;
+     point 2 already holds; a name that doesn't resolve counts as another machine;
   2. the port is the relay's RTMP port (`1935`, or the scheme's default when none is
-     given);
-  3. the path (server path + stream key, query ignored) is the plugin's own (`service`).
+     given).
 
-  OBS sending to this PC's relay on a *different* path is no clash, so the shadow output
-  runs. Re-checked on every stream start; the decision is logged once per change
-  (`[castbeacon] main output check: ...`), naming the host and port and saying only
-  "key matches" or "key differs" — the stream key itself is never logged.
+  The path (server path + stream key, query ignored) is still compared, but only for the
+  log. Re-checked on every stream start; the decision is logged once per change
+  (`[castbeacon] main output check: ...`), naming the host and port and saying
+  "path service" or "other path" — OBS's stream key is never logged.
 
 OBS performs all encoding; this plugin only asks OBS to create and configure an encoder.
 
@@ -164,9 +165,10 @@ ctest --test-dir build_tests -C Release --output-on-failure
 - **1.3.2** — The stand-aside check recognises this PC by any of its own addresses and by
   its hostname, not only by `127.0.0.1` / `localhost` / `::1`: OBS pointed at the relay by
   the PC's LAN address no longer gets a second publisher on the same path (the two
-  knocked each other off in a reconnect loop). The check now also compares the path and
-  stream key, so OBS sending to a *different* relay path no longer silences the shadow
-  output. Unit tests added (`tests/`).
+  knocked each other off in a reconnect loop). OBS pointed at this PC's relay on *any*
+  path means "OBS sends straight to Cast Beacon", so the shadow stands aside and never
+  publishes into `service` behind the operator's back; the path is compared for the log
+  only. Unit tests added (`tests/`).
 - **1.3.1** — Installs to `C:\ProgramData\obs-studio\plugins\castbeacon`, where OBS
   actually scans on Windows.
 - **1.3.0** — Module renamed `castpilot` → `castbeacon`; the old settings path is still

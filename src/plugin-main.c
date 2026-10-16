@@ -18,9 +18,10 @@
  * picks the app's service in OBS and the app fans out to the platforms). In that setup the shadow
  * output would publish to the SAME relay path as the main output, and the relay only allows one
  * publisher per path — the two outputs then kick each other loose every couple of seconds. So on
- * every stream start we look at OBS's own stream service: if it publishes to THIS machine (by
- * loopback, any of its own addresses or its hostname), on the relay's RTMP port, to the very
- * path the shadow uses, the shadow output stands aside (stand-aside.c holds that decision).
+ * every stream start we look at OBS's own stream service: if it points at THIS machine (by
+ * loopback, any of its own addresses or its hostname) on the relay's RTMP port, the operator has
+ * chosen "OBS sends straight to Cast Beacon" and the shadow output stands aside - on ANY path, so it
+ * never publishes into "service" behind the operator's back (stand-aside.c holds that decision).
  * Everything else behaves exactly as before.
  */
 
@@ -43,7 +44,7 @@ static const char *SHADOW_KEY = "service";
 
 /* How long a stream start may wait on DNS, at most, to learn whether a name is this machine. It is
  * spent only when the name is neither loopback nor this machine's hostname AND the output's port
- * and path already match the shadow's - i.e. only when the answer decides a clash. */
+ * is the relay's - i.e. only when the answer decides it. */
 #define RESOLVE_TIMEOUT_MS 1000
 
 static obs_output_t *shadow_output = NULL;
@@ -146,8 +147,8 @@ static void load_local_cfg(int *keyint, int *bitrate_kbps, int *width, int *heig
 }
 
 /* The decision line last logged: the stand-aside decision is logged once per CHANGE, not on every
- * stream start. It names what was compared - host, port, and whether the key matches - and never
- * the stream key, the path (which holds the key) or the URL (which may hold it too). */
+ * stream start. It names what was compared - host, port, and "path service" or "other path" - and
+ * never the stream key, OBS's path (which holds the key) or the URL (which may hold it too). */
 static char last_decision[512];
 
 static void log_decision_once(const char *line)
@@ -156,11 +157,6 @@ static void log_decision_once(const char *line)
 		return;
 	obs_log(LOG_INFO, "%s", line);
 	snprintf(last_decision, sizeof(last_decision), "%s", line);
-}
-
-static bool host_is_this_pc(enum cb_host_kind k)
-{
-	return k == CB_HOST_LOOPBACK || k == CB_HOST_LOCAL_ADDR || k == CB_HOST_HOSTNAME || k == CB_HOST_RESOLVES_LOCAL;
 }
 
 static void log_decision(const struct cb_url *u, const struct cb_url *relay, const struct cb_decision *d)
@@ -173,12 +169,7 @@ static void log_decision(const struct cb_url *u, const struct cb_url *relay, con
 	} else {
 		const char *outcome;
 		if (d->verdict == CB_STAND_ASIDE)
-			outcome = "OBS's main output already publishes the shadow's path - standing aside";
-		else if (d->verdict == CB_RUN_OTHER_PATH && host_is_this_pc(d->host))
-			outcome = "OBS sends to this PC's relay but a different path - no clash, shadow output "
-				  "proceeds alongside it";
-		else if (d->verdict == CB_RUN_OTHER_PATH)
-			outcome = "different path - no clash, shadow output proceeds";
+			outcome = "OBS sends straight to this PC's relay - standing aside";
 		else if (d->verdict == CB_RUN_OTHER_PORT)
 			outcome = "not the relay's port - no clash, shadow output proceeds";
 		else
@@ -190,9 +181,16 @@ static void log_decision(const struct cb_url *u, const struct cb_url *relay, con
 		else
 			dstr_copy(&port, "port unknown");
 
-		dstr_printf(&line, "main output check: host %s: %s; %s (relay %d); key %s - %s", u->host,
-			    cb_host_kind_text(d->host), port.array, relay->port,
-			    d->path_matches ? "matches" : "differs", outcome);
+		/* "path service" names the SHADOW's compiled-in path, never anything read from OBS */
+		struct dstr path = {0};
+		if (d->path_matches)
+			dstr_printf(&path, "path %s", relay->path);
+		else
+			dstr_copy(&path, "other path");
+
+		dstr_printf(&line, "main output check: host %s: %s; %s (relay %d); %s - %s", u->host,
+			    cb_host_kind_text(d->host), port.array, relay->port, path.array, outcome);
+		dstr_free(&path);
 		dstr_free(&port);
 	}
 

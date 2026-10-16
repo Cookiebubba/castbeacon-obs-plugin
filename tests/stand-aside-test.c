@@ -136,7 +136,6 @@ static void test_ipv6(void)
 	EXPECT("rtmp://[::ffff:192.168.1.20]:1935", "service", CB_STAND_ASIDE, CB_HOST_LOCAL_ADDR); /* v4-mapped */
 	EXPECT("rtmp://[::ffff:127.0.0.1]:1935", "service", CB_STAND_ASIDE, CB_HOST_LOOPBACK);
 	EXPECT("rtmp://[2001:db8::99]:1935", "service", CB_RUN_OTHER_HOST, CB_HOST_OTHER);
-	EXPECT("rtmp://[2001:db8::20]:1935", "other", CB_RUN_OTHER_PATH, CB_HOST_LOCAL_ADDR);
 }
 
 static void test_hostname(void)
@@ -174,18 +173,42 @@ static void test_hostname(void)
 	this_pc.hostname = saved;
 }
 
+/* Decide with a DNS answer and return it, so a test can also read the log-only path flag. */
+static struct cb_decision decide_resolved(const char *server, const char *key, const char *answer)
+{
+	struct cb_addr a = ip(answer);
+	return decide_rs(server, key, CB_RESOLVE_OK, &a, 1);
+}
+
 static void test_right_host_wrong_path(void)
 {
-	/* this PC's relay, a different path: no clash, so the shadow runs */
-	EXPECT("rtmp://127.0.0.1:1935", "abc", CB_RUN_OTHER_PATH, CB_HOST_LOOPBACK);
-	EXPECT("rtmp://192.168.1.20:1935", "abc", CB_RUN_OTHER_PATH, CB_HOST_LOCAL_ADDR);
-	EXPECT("rtmp://studio-pc:1935", "abc", CB_RUN_OTHER_PATH, CB_HOST_HOSTNAME);
-	EXPECT("rtmp://127.0.0.1:1935", "Service", CB_RUN_OTHER_PATH, CB_HOST_LOOPBACK); /* paths are case-sensitive */
-	EXPECT("rtmp://127.0.0.1:1935/live", "service", CB_RUN_OTHER_PATH, CB_HOST_LOOPBACK); /* live/service */
-	EXPECT("rtmp://127.0.0.1:1935", "", CB_RUN_OTHER_PATH, CB_HOST_LOOPBACK);
-	EXPECT("rtmp://127.0.0.1:1935", "service2", CB_RUN_OTHER_PATH, CB_HOST_LOOPBACK);
-	/* a name on the right port but a different path never costs a lookup */
-	EXPECT("rtmp://studio-pc.lan:1935", "abc", CB_RUN_OTHER_PATH, CB_HOST_NOT_CHECKED);
+	/* READ INTENT: OBS pointed at this PC's relay means "OBS sends straight to Cast Beacon", on ANY
+	 * path. The shadow stands aside - it must never publish into "service" behind the operator's
+	 * back (that stream's autostart / platform pushes would fire). */
+	EXPECT("rtmp://127.0.0.1:1935", "abc", CB_STAND_ASIDE, CB_HOST_LOOPBACK);
+	EXPECT("rtmp://192.168.1.20:1935", "abc", CB_STAND_ASIDE, CB_HOST_LOCAL_ADDR);
+	EXPECT("rtmp://[2001:db8::20]:1935", "other", CB_STAND_ASIDE, CB_HOST_LOCAL_ADDR);
+	EXPECT("rtmp://studio-pc:1935", "abc", CB_STAND_ASIDE, CB_HOST_HOSTNAME);
+	EXPECT("rtmp://127.0.0.1:1935", "Service", CB_STAND_ASIDE, CB_HOST_LOOPBACK);
+	EXPECT("rtmp://127.0.0.1:1935/live", "service", CB_STAND_ASIDE, CB_HOST_LOOPBACK);
+	EXPECT("rtmp://127.0.0.1:1935", "", CB_STAND_ASIDE, CB_HOST_LOOPBACK);
+	EXPECT("rtmp://127.0.0.1:1935", "service2", CB_STAND_ASIDE, CB_HOST_LOOPBACK);
+
+	/* a name on the relay's port needs the lookup whatever its path... */
+	EXPECT("rtmp://studio-pc.lan:1935", "abc", CB_NEED_RESOLVE, CB_HOST_NOT_CHECKED);
+	struct cb_decision d = decide_resolved("rtmp://studio-pc.lan:1935", "abc", "192.168.1.20");
+	CHECK(d.verdict == CB_STAND_ASIDE && d.host == CB_HOST_RESOLVES_LOCAL, "name -> here, other path: verdict %d",
+	      d.verdict);
+
+	/* ...and the path is still compared, for the log line only ("path service" / "other path") */
+	d = decide("rtmp://127.0.0.1:1935", "service");
+	CHECK(d.path_matches, "same path is reported as the shadow's path");
+	d = decide("rtmp://127.0.0.1:1935", "abc");
+	CHECK(!d.path_matches && d.verdict == CB_STAND_ASIDE, "other path: reported, and still stands aside");
+	d = decide("rtmp://127.0.0.1:1935/service", NULL);
+	CHECK(d.path_matches, "path in the server URL counts as the path");
+	d = decide("rtmp://127.0.0.1:1935", "service?user=a&pass=b");
+	CHECK(d.path_matches, "a query on the key is not part of the path");
 }
 
 static void test_wrong_port(void)
@@ -203,8 +226,14 @@ static void test_other_machine(void)
 	EXPECT("rtmp://192.168.1.99:1935", "service", CB_RUN_OTHER_HOST, CB_HOST_OTHER);
 	EXPECT("rtmp://192.168.1.21:1935/service", "", CB_RUN_OTHER_HOST, CB_HOST_OTHER);
 	EXPECT("rtmp://10.0.0.5", "service", CB_RUN_OTHER_HOST, CB_HOST_OTHER);
-	/* a platform: right port, different path - decided without a lookup */
-	EXPECT("rtmp://a.rtmp.youtube.com/live2", "abcd-efgh-ijkl-mnop", CB_RUN_OTHER_PATH, CB_HOST_NOT_CHECKED);
+	/* a platform on RTMP's default port: only its address can rule it out */
+	EXPECT("rtmp://a.rtmp.youtube.com/live2", "abcd-efgh-ijkl-mnop", CB_NEED_RESOLVE, CB_HOST_NOT_CHECKED);
+	struct cb_decision d = decide_resolved("rtmp://a.rtmp.youtube.com/live2", "abcd-efgh-ijkl-mnop", "142.250.1.1");
+	CHECK(d.verdict == CB_RUN_OTHER_HOST && d.host == CB_HOST_OTHER, "platform resolved elsewhere: verdict %d",
+	      d.verdict);
+	d = decide_rs("rtmp://a.rtmp.youtube.com/live2", "abcd-efgh-ijkl-mnop", CB_RESOLVE_FAILED, NULL, 0);
+	CHECK(d.verdict == CB_RUN_OTHER_HOST, "platform lookup timed out: verdict %d", d.verdict);
+	/* a platform on another port is decided without a lookup */
 	EXPECT("rtmps://live-api-s.facebook.com:443/rtmp/", "FB-123", CB_RUN_OTHER_PORT, CB_HOST_NOT_CHECKED);
 }
 

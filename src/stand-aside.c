@@ -496,7 +496,7 @@ void cb_decide(const struct cb_url *u, bool parsed, const struct cb_local *local
 		out->host = CB_HOST_UNRESOLVED;
 	} else {
 		out->host = CB_HOST_NOT_CHECKED;
-		if (out->port_matches && out->path_matches) {
+		if (out->port_matches) {
 			/* the only fact left that decides it is where the name points */
 			out->verdict = CB_NEED_RESOLVE;
 			return;
@@ -507,9 +507,7 @@ void cb_decide(const struct cb_url *u, bool parsed, const struct cb_local *local
 		out->verdict = CB_RUN_OTHER_HOST;
 	else if (!out->port_matches)
 		out->verdict = CB_RUN_OTHER_PORT;
-	else if (!out->path_matches)
-		out->verdict = CB_RUN_OTHER_PATH;
-	else
+	else /* this PC's relay, ANY path: the operator chose "OBS sends straight to Cast Beacon" */
 		out->verdict = CB_STAND_ASIDE;
 }
 
@@ -547,8 +545,6 @@ const char *cb_verdict_text(enum cb_verdict v)
 		return "OBS sends to another machine - no clash";
 	case CB_RUN_OTHER_PORT:
 		return "OBS sends to another port - no clash";
-	case CB_RUN_OTHER_PATH:
-		return "OBS sends to a different path - no clash";
 	case CB_NEED_RESOLVE:
 		return "host needs a lookup";
 	}

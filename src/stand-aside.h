@@ -1,9 +1,12 @@
 /*
  * Cast Beacon OBS Plugin (GPLv2).
  *
- * The stand-aside decision: does OBS's MAIN stream output already publish to the exact relay path
- * the shadow output would publish to? If it does, the two would be two publishers on one path, and
- * the relay allows one, so the shadow output must not start.
+ * The stand-aside decision, read from INTENT: does OBS's MAIN stream output point at THIS machine's
+ * relay (this machine + the relay's RTMP port)? Then the operator has chosen "OBS sends straight to
+ * Cast Beacon", and the shadow output must not start - on ANY path. On the same path it would be a
+ * second publisher (the relay allows one); on another path it would publish OBS's program into the
+ * shadow's path ("service"), which can trigger that stream's autostart or platform pushes. The path
+ * is still compared, but only so the log can say "path service" or "other path".
  *
  * Everything in here is PURE: no libobs, no sockets, no DNS, no clock. The caller gathers this
  * machine's facts (its interface addresses, its hostname and, only when asked for, what a name
@@ -64,15 +67,14 @@ enum cb_host_kind {
 	CB_HOST_RESOLVES_LOCAL, /* a name that resolved to an address of this machine */
 	CB_HOST_OTHER,          /* another machine (an address, or a name that resolved elsewhere) */
 	CB_HOST_UNRESOLVED,     /* a name that did not resolve: treated as another machine */
-	CB_HOST_NOT_CHECKED,    /* a name not looked up, because port or path already rule a clash out */
+	CB_HOST_NOT_CHECKED,    /* a name not looked up, because the port already rules it out */
 };
 
 enum cb_verdict {
-	CB_STAND_ASIDE,     /* same machine, same port, same path: the shadow must not start */
+	CB_STAND_ASIDE,     /* this machine, the relay's port (any path): the shadow must not start */
 	CB_RUN_UNPARSEABLE, /* could not read the URL: no evidence of a clash */
 	CB_RUN_OTHER_HOST,  /* another machine */
 	CB_RUN_OTHER_PORT,  /* not the relay's RTMP port */
-	CB_RUN_OTHER_PATH,  /* the relay's port but a different path: no clash */
 	CB_NEED_RESOLVE,    /* only DNS can say whether the host is this machine: resolve, ask again */
 };
 
@@ -80,7 +82,7 @@ struct cb_decision {
 	enum cb_verdict verdict;
 	enum cb_host_kind host;
 	bool port_matches;
-	bool path_matches; /* "key matches" in the log - the key itself is never logged */
+	bool path_matches; /* for the log only ("path service" / "other path"); never decides */
 };
 
 /* Parse an IP literal ("192.168.1.20", "::1", "fe80::1%eth0" - the zone is ignored). Strict:
