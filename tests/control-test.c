@@ -64,9 +64,16 @@ struct task {
 static cb_mutex *queue_lock;
 static struct task *queue_head = NULL, *queue_tail = NULL;
 
+/* Every post_ui call, counted - after cb_ctl_exit there must be NONE: in OBS that call is
+ * obs_queue_task, which must never run after obs_shutdown. */
+static volatile long posts = 0;
+
 static void fake_post(void *ctx, void (*fn)(void *), void *arg)
 {
 	(void)ctx;
+	cb_mutex_lock(queue_lock);
+	posts++;
+	cb_mutex_unlock(queue_lock);
 	struct task *t = calloc(1, sizeof(*t));
 	if (!t)
 		return;
@@ -199,6 +206,14 @@ static bool fake_pin(void)
 }
 
 /* ------------------------------------------------------------------ setup */
+
+static long posts_now(void)
+{
+	cb_mutex_lock(queue_lock);
+	long n = posts;
+	cb_mutex_unlock(queue_lock);
+	return n;
+}
 
 static void reset(void)
 {
@@ -415,9 +430,12 @@ static void test_exit_and_unload(void)
 	cb_ctl_stream_started("slow-run", "k");
 	pump_for(50);
 	cb_ctl_exit();
+	long posted_at_exit = posts_now();
 	cb_event_signal(gate);
 	pump_for(150);
 	CHECK(!shadow_up && starts == 0, "an answer after EXIT does nothing");
+	CHECK(posts_now() == posted_at_exit, "and is never even posted after EXIT (%ld posts)",
+	      posts_now() - posted_at_exit);
 	cb_ctl_shutdown();
 	pump();
 
@@ -430,9 +448,12 @@ static void test_exit_and_unload(void)
 	CHECK(pins == 1, "pinned once (%d)", pins);
 	CHECK(took < 1000, "did not wait for the stuck decider (%llu ms)", took);
 	CHECK(strstr(log_text, "module kept loaded") != NULL, "logged: %s", log_text);
+	long posted_at_unload = posts_now();
 	cb_event_signal(gate); /* let the detached one finish */
 	pump_for(150);
 	CHECK(!shadow_up && starts == 0, "its answer never acted");
+	CHECK(posts_now() == posted_at_unload, "the detached decider posted nothing after unload (%ld posts)",
+	      posts_now() - posted_at_unload);
 }
 
 static void release_later(void *arg)
